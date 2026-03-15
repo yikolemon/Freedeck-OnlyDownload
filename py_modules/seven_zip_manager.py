@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
@@ -16,11 +17,62 @@ class SevenZipError(RuntimeError):
     """7z 相关异常。"""
 
 
+class SevenZipCancelledError(SevenZipError):
+    """7z 解压被取消。"""
+
+
 class SevenZipManager:
     """7z 解压管理器。"""
 
     def __init__(self, plugin_dir: str):
         self._plugin_dir = str(plugin_dir or "")
+
+    @staticmethod
+    def _diagnose_failure(output_tail: Sequence[str]) -> str:
+        """根据 7z 输出内容推断常见失败原因（用于更友好提示）。"""
+        lines = [str(line or "").strip() for line in list(output_tail or []) if str(line or "").strip()]
+        if not lines:
+            return ""
+
+        joined = "\n".join(lines)
+        lower = joined.lower()
+
+        # 密码/加密
+        if "wrong password" in lower or ("password" in lower and "wrong" in lower) or "encrypted" in lower:
+            return "可能原因：压缩包需要密码或密码错误"
+
+        # 空间不足/写入失败
+        if "no space left on device" in lower or "not enough space" in lower or "write error" in lower:
+            return "可能原因：磁盘空间不足或写入失败"
+
+        # 权限问题
+        if "permission denied" in lower:
+            return "可能原因：权限不足，无法写入安装目录"
+
+        # 分卷缺失/找不到文件
+        if "no such file" in lower or "cannot open file" in lower or "can not open file" in lower or "cannot find" in lower:
+            match = re.search(r"(?i)(?:can(?:not| not)|cannot)\s+open\s+file\s+'([^']+)'", joined)
+            if match:
+                missing = os.path.basename(match.group(1) or "").strip()
+                if missing:
+                    return f"可能原因：缺少分卷文件 {missing}（请确保同一组分卷全部下载完成且文件名未改动）"
+            return "可能原因：分卷缺失或文件路径无效"
+
+        # 压缩包损坏/不完整
+        if (
+            "unexpected end of archive" in lower
+            or "data error" in lower
+            or "crc failed" in lower
+            or "headers error" in lower
+            or "checksum error" in lower
+        ):
+            return "可能原因：压缩包损坏或下载不完整"
+
+        # 不是压缩包/格式不支持
+        if "is not archive" in lower or "cannot open the file as" in lower:
+            return "可能原因：文件不是有效压缩包（可能下载到错误内容或下载不完整）"
+
+        return ""
 
     def _resolve_binary_path(self) -> str:
         """优先解析插件内置 7z，可回退系统命令。"""
@@ -53,6 +105,7 @@ class SevenZipManager:
         archive_path: str,
         output_dir: str,
         progress_cb: Optional[Callable[[float], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> None:
         """执行解压流程。"""
         archive = os.path.realpath(os.path.expanduser((archive_path or "").strip()))
@@ -61,6 +114,8 @@ class SevenZipManager:
             raise SevenZipError(f"待解压文件不存在: {archive_path}")
         if not target:
             raise SevenZipError("安装目录无效")
+        if cancel_event is not None and cancel_event.is_set():
+            raise SevenZipCancelledError("解压已取消")
         os.makedirs(target, exist_ok=True)
 
         binary = self._resolve_binary_path()
@@ -81,9 +136,11 @@ class SevenZipManager:
             "-bsp1",
         ]
 
+        cwd = os.path.dirname(archive) or None
         try:
             process = subprocess.Popen(
                 args,
+                cwd=cwd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -93,14 +150,50 @@ class SevenZipManager:
         except Exception as exc:
             raise SevenZipError(f"启动 7z 失败: {exc}") from exc
 
+        if cancel_event is not None:
+            def _watch_cancel() -> None:
+                while True:
+                    try:
+                        if process.poll() is not None:
+                            return
+                    except Exception:
+                        return
+                    try:
+                        if cancel_event.wait(timeout=0.25):
+                            break
+                    except Exception:
+                        return
+
+                try:
+                    if process.poll() is not None:
+                        return
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        process.wait(timeout=3.0)
+                    except Exception:
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                except Exception:
+                    return
+
+            threading.Thread(target=_watch_cancel, name="freedeck_7z_cancel", daemon=True).start()
+
         percent_re = re.compile(r"(\d{1,3})%")
         output_tail: List[str] = []
+        max_tail_lines = 40
         if process.stdout is not None:
             for line in process.stdout:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 text = line.strip()
                 if text:
                     output_tail.append(text)
-                    if len(output_tail) > 12:
+                    if len(output_tail) > max_tail_lines:
                         output_tail.pop(0)
                 match = percent_re.search(text)
                 if match and progress_cb:
@@ -110,9 +203,13 @@ class SevenZipManager:
                         pass
 
         return_code = process.wait()
+        if cancel_event is not None and cancel_event.is_set():
+            raise SevenZipCancelledError("解压已取消")
         if return_code != 0:
-            hint = " | ".join(output_tail[-6:]) if output_tail else "no output"
-            raise SevenZipError(f"7z 解压失败，exit={return_code}，诊断={hint}")
+            hint = " | ".join(output_tail[-10:]) if output_tail else "no output"
+            diagnosis = self._diagnose_failure(output_tail)
+            extra = f"，{diagnosis}" if diagnosis else ""
+            raise SevenZipError(f"7z 解压失败，exit={return_code}{extra}，诊断={hint}")
 
         if progress_cb:
             try:

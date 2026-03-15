@@ -242,16 +242,53 @@ async def load_settings(plugin: Any) -> None:
     except Exception:
         plugin.server_port = config.DEFAULT_SERVER_PORT
 
+    # 旧版本默认端口迁移到当前默认端口（20064），避免遗留设置导致端口冲突。
+    legacy_default_port = 0xE787
+    if int(getattr(plugin, "server_port", 0) or 0) == legacy_default_port:
+        plugin.server_port = config.DEFAULT_SERVER_PORT
+        try:
+            await save_settings(plugin)
+        except Exception:
+            pass
+
     download_dir = settings.get(plugin.SETTING_DOWNLOAD_DIR, config.DOWNLOADS_DIR)
     if isinstance(download_dir, str) and download_dir.strip():
         plugin.downloads_dir = os.path.realpath(os.path.expanduser(download_dir.strip()))
     else:
         plugin.downloads_dir = config.DOWNLOADS_DIR
 
+    # 下载目录容错：用户选择的目录被外部删除/卸载/变为文件时，避免插件初始化直接失败。
+    base_home = "/home/deck" if os.path.isdir("/home/deck") else os.path.expanduser("~")
+    fallback_dir = os.path.realpath(os.path.join(base_home, "Game"))
+
+    resolved = str(getattr(plugin, "downloads_dir", "") or "").strip()
+    invalid_reason = ""
+    try:
+        if not resolved:
+            invalid_reason = "empty"
+        elif os.path.exists(resolved) and not os.path.isdir(resolved):
+            invalid_reason = "not_dir"
+        elif not os.path.exists(resolved):
+            invalid_reason = "missing"
+        elif not os.access(resolved, os.W_OK | os.X_OK):
+            invalid_reason = "not_writable"
+    except Exception:
+        invalid_reason = "check_failed"
+
+    if invalid_reason:
+        config.logger.warning("Invalid download_dir from settings, fallback: %s reason=%s", resolved, invalid_reason)
+        plugin.downloads_dir = fallback_dir
+
     try:
         os.makedirs(plugin.downloads_dir, exist_ok=True)
     except Exception as exc:
-        config.logger.warning(f"Ensure download directory failed: {exc}")
+        config.logger.warning("Ensure download directory failed: %s (%s)", plugin.downloads_dir, exc)
+        # 最后兜底到 /tmp，保证插件仍可启动（用户可在设置中重新选择）。
+        plugin.downloads_dir = os.path.realpath(os.path.join("/tmp", "freedeck", "downloads"))
+        try:
+            os.makedirs(plugin.downloads_dir, exist_ok=True)
+        except Exception as inner_exc:
+            config.logger.error("Ensure tmp download directory failed: %s", inner_exc)
 
 
 async def save_settings(plugin: Any) -> None:

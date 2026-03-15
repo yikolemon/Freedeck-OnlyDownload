@@ -45,6 +45,17 @@ def _json_error_from_exception(exc: Exception, status: int = 400) -> web.Respons
     return _json_error(str(exc), status=status, diagnostics=diagnostics)
 
 
+def _no_cache_headers(resp: web.StreamResponse) -> web.StreamResponse:
+    """禁用静态页面缓存，避免 Steam 浏览器缓存导致页面不更新。"""
+    try:
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    except Exception:
+        pass
+    return resp
+
+
 def _ui_root() -> Optional[Path]:
     """解析游戏库页面静态目录。"""
     plugin_dir = getattr(decky, "DECKY_PLUGIN_DIR", None)
@@ -86,7 +97,7 @@ async def _serve_ui_file(filename: str) -> web.StreamResponse:
     target = _safe_asset_path(root, filename)
     if target is None:
         return _json_error(f"页面资源缺失: {filename}", 503)
-    return web.FileResponse(target)
+    return _no_cache_headers(web.FileResponse(target))
 
 
 async def handle_library_index(request: web.Request, plugin: Any) -> web.StreamResponse:
@@ -111,7 +122,7 @@ async def handle_library_static(request: web.Request, plugin: Any) -> web.Stream
         target = _safe_asset_path(root, "index.html")
         if target is None:
             return _json_error("页面资源不存在", 404)
-    return web.FileResponse(target)
+    return _no_cache_headers(web.FileResponse(target))
 
 
 async def handle_state(request: web.Request, plugin: Any) -> web.Response:
@@ -121,6 +132,59 @@ async def handle_state(request: web.Request, plugin: Any) -> web.Response:
         tasks = data.get("tasks", []) if isinstance(data, dict) else []
         plan = data.get("plan", {}) if isinstance(data, dict) else {}
         return _json_ok({"data": {"tasks": tasks, "plan": plan}})
+    except Exception as exc:
+        return _json_error_from_exception(exc, 500)
+
+
+async def handle_debug_log(request: web.Request, plugin: Any) -> web.Response:
+    """接收网页端调试日志（用于定位 OSK/焦点等问题）。"""
+    try:
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+
+        message = str(body.get("message", "") or "").strip() or "debug"
+        details = body.get("details", None)
+
+        safe_details = details
+        try:
+            if safe_details is not None and not isinstance(
+                safe_details,
+                (str, int, float, bool, list, dict),
+            ):
+                safe_details = str(safe_details)
+        except Exception:
+            safe_details = str(details)
+
+        try:
+            decky.logger.info("[ui] %s | %s", message, safe_details)
+        except Exception:
+            pass
+        try:
+            config.logger.info("[ui] %s | %s", message, safe_details)
+        except Exception:
+            pass
+
+        return _json_ok({"message": "ok"})
+    except Exception as exc:
+        return _json_error_from_exception(exc, 500)
+
+
+async def handle_keyboard_request(request: web.Request, plugin: Any) -> web.Response:
+    """网页端键盘输入桥接：把请求转给 Decky 容器并等待结果。"""
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        data = await plugin.request_tianyi_keyboard_input(body)
+        return _json_ok({"data": data})
     except Exception as exc:
         return _json_error_from_exception(exc, 500)
 
@@ -259,7 +323,42 @@ async def handle_catalog(request: web.Request, plugin: Any) -> web.Response:
         query = str(request.query.get("q", "")).strip()
         page = int(request.query.get("page", "1"))
         page_size = int(request.query.get("page_size", request.query.get("pageSize", "0")))
-        data = await _service(plugin).list_catalog(query, page, page_size)
+        sort_mode = str(request.query.get("sort_mode", request.query.get("sortMode", "default")) or "default").strip() or "default"
+        data = await _service(plugin).list_catalog(query, page, page_size, sort_mode)
+        return _json_ok({"data": data})
+    except Exception as exc:
+        return _json_error_from_exception(exc)
+
+
+async def handle_switch_catalog(request: web.Request, plugin: Any) -> web.Response:
+    """查询 Switch 模拟器资源目录列表。"""
+    try:
+        query = str(request.query.get("q", "")).strip()
+        page = int(request.query.get("page", "1"))
+        page_size = int(request.query.get("page_size", request.query.get("pageSize", "0")))
+        sort_mode = str(request.query.get("sort_mode", request.query.get("sortMode", "default")) or "default").strip() or "default"
+        data = await _service(plugin).list_switch_catalog(query, page, page_size, sort_mode)
+        return _json_ok({"data": data})
+    except Exception as exc:
+        return _json_error_from_exception(exc)
+
+
+async def handle_switch_emulator_status(request: web.Request, plugin: Any) -> web.Response:
+    """读取 Switch 模拟器安装状态。"""
+    try:
+        data = await _service(plugin).get_switch_emulator_status()
+        return _json_ok({"data": data})
+    except Exception as exc:
+        return _json_error_from_exception(exc)
+
+
+async def handle_gba_catalog(request: web.Request, plugin: Any) -> web.Response:
+    """查询 GBA 模拟器资源目录列表（静态 CSV）。"""
+    try:
+        query = str(request.query.get("q", "")).strip()
+        page = int(request.query.get("page", "1"))
+        page_size = int(request.query.get("page_size", request.query.get("pageSize", "0")))
+        data = await _service(plugin).list_gba_catalog(query, page, page_size)
         return _json_ok({"data": data})
     except Exception as exc:
         return _json_error_from_exception(exc)
@@ -290,13 +389,30 @@ async def handle_settings_set(request: web.Request, plugin: Any) -> web.Response
     """保存设置。"""
     try:
         body = await request.json()
+        aria2_fast_mode = body.get("aria2_fast_mode") if "aria2_fast_mode" in body else None
+        force_ipv4 = body.get("force_ipv4") if "force_ipv4" in body else None
+        auto_switch_line = body.get("auto_switch_line") if "auto_switch_line" in body else None
+        steamgriddb_enabled = body.get("steamgriddb_enabled") if "steamgriddb_enabled" in body else None
+        steamgriddb_api_key = body.get("steamgriddb_api_key") if "steamgriddb_api_key" in body else None
+        lsfg_enabled = body.get("lsfg_enabled") if "lsfg_enabled" in body else None
+        show_playtime_widget = body.get("show_playtime_widget") if "show_playtime_widget" in body else None
+        cloud_save_auto_upload = body.get("cloud_save_auto_upload") if "cloud_save_auto_upload" in body else None
         data = await _service(plugin).update_settings(
             download_dir=body.get("download_dir"),
             install_dir=body.get("install_dir"),
+            emulator_dir=body.get("emulator_dir"),
             split_count=body.get("split_count"),
+            aria2_fast_mode=aria2_fast_mode,
+            force_ipv4=force_ipv4,
+            auto_switch_line=auto_switch_line,
             page_size=body.get("page_size"),
             auto_delete_package=body.get("auto_delete_package"),
             auto_install=body.get("auto_install"),
+            lsfg_enabled=lsfg_enabled,
+            show_playtime_widget=show_playtime_widget,
+            cloud_save_auto_upload=cloud_save_auto_upload,
+            steamgriddb_enabled=steamgriddb_enabled,
+            steamgriddb_api_key=steamgriddb_api_key,
         )
         return _json_ok({"data": data})
     except Exception as exc:
@@ -514,6 +630,8 @@ def setup_routes(app: web.Application, plugin: Any) -> None:
 
     # 业务 API
     app.router.add_get("/api/tianyi/state", lambda request: handle_state(request, plugin))
+    app.router.add_post("/api/tianyi/debug/log", lambda request: handle_debug_log(request, plugin))
+    app.router.add_post("/api/tianyi/keyboard/request", lambda request: handle_keyboard_request(request, plugin))
     app.router.add_get("/api/tianyi/login-url", lambda request: handle_login_url(request, plugin))
     app.router.add_get("/api/tianyi/login", lambda request: handle_login_redirect(request, plugin))
     app.router.add_post("/api/tianyi/login/check", lambda request: handle_login_check(request, plugin))
@@ -529,6 +647,9 @@ def setup_routes(app: web.Application, plugin: Any) -> None:
     app.router.add_get("/api/tianyi/login/qr/image", lambda request: handle_login_qr_image(request, plugin))
 
     app.router.add_get("/api/tianyi/catalog", lambda request: handle_catalog(request, plugin))
+    app.router.add_get("/api/tianyi/emulator/switch/catalog", lambda request: handle_switch_catalog(request, plugin))
+    app.router.add_get("/api/tianyi/emulator/switch/status", lambda request: handle_switch_emulator_status(request, plugin))
+    app.router.add_get("/api/tianyi/emulator/gba/catalog", lambda request: handle_gba_catalog(request, plugin))
     app.router.add_get("/api/tianyi/catalog/cover", lambda request: handle_catalog_cover(request, plugin))
     app.router.add_get("/api/tianyi/settings", lambda request: handle_settings_get(request, plugin))
     app.router.add_post("/api/tianyi/settings", lambda request: handle_settings_set(request, plugin))

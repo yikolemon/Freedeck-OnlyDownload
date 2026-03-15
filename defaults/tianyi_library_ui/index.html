@@ -3,34 +3,209 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Freedeck</title>
-  <link rel="stylesheet" href="/tianyi/library/app.css" />
+  <meta name="color-scheme" content="dark" />
+  <title>Freedeck 游戏库</title>
+  <link rel="stylesheet" href="/tianyi/library/app.css?v=20260312_1" />
 </head>
 <body>
   <main id="app" v-cloak class="page">
-    <section class="hero">
-      <h1 class="brand">Freedeck</h1>
-      <form class="search-bar" @submit.prevent="reloadList(1)">
-        <input
-          id="search-input"
-          v-model="query"
-          :class="{ 'focus-ring': focusedIndex === 0 }"
-          type="text"
-          placeholder="搜索游戏名称"
-          autocomplete="off"
-          aria-label="搜索游戏名称"
-        />
-        <button id="search-button" :class="{ 'focus-ring': focusedIndex === 1 }" type="submit">搜索</button>
-      </form>
-      <p class="hint">{{ hintText }}</p>
+    <section class="hero library-hero" v-if="view === 'library'">
+      <template v-if="uiMode === 'search'">
+        <form class="search-bar" @submit.prevent="reloadList(1)">
+          <input
+            id="search-input"
+            v-model="query"
+            :class="{ 'focus-ring': focusedIndex === 0 }"
+            type="text"
+            placeholder="搜索游戏（留空浏览全部）"
+            autocomplete="off"
+            aria-label="搜索游戏名称"
+            @input="onQueryInput"
+            @focus="onTextInputFocus('search')"
+            @click="onTextInputClick('search')"
+          />
+          <button
+            id="custom-source-button"
+            class="btn-secondary"
+            :class="{ 'focus-ring': focusedIndex === 1 }"
+            type="button"
+            @click="switchView('custom')"
+          >
+            自定义源
+          </button>
+          <button
+            id="emulator-button"
+            class="btn-secondary"
+            :class="{ 'focus-ring': focusedIndex === 2 }"
+            type="button"
+            @click="openEmulatorPage"
+          >
+            模拟器
+          </button>
+        </form>
+        <p class="hint" style="color: var(--md-sys-color-error)" v-if="catalog.error">{{ catalog.error }}</p>
+      </template>
+
+      <template v-else>
+        <div class="library-header">
+          <h1 class="library-title">Freedeck 游戏库</h1>
+          <p class="library-status">{{ catalogStatusText }}</p>
+          <p class="library-status library-status-bad" v-if="catalog.error">{{ catalog.error }}</p>
+        </div>
+
+        <form class="library-toolbar" @submit.prevent="reloadList(1)">
+          <div class="library-toolbar-row">
+            <input
+              id="search-input"
+              v-model="query"
+              :class="{ 'focus-ring': focusedIndex === 0 }"
+              type="text"
+              placeholder="搜索游戏（留空浏览全部）"
+              autocomplete="off"
+              aria-label="搜索游戏名称"
+              @input="onQueryInput"
+              @focus="onTextInputFocus('search')"
+              @click="onTextInputClick('search')"
+            />
+          </div>
+
+          <div class="library-toolbar-controls">
+            <div class="library-filters" aria-label="筛选与排序">
+              <div class="md3-select-anchor">
+                <button
+                  id="catalog-category-select"
+                  type="button"
+                  :class="['md3-select-field', { open: categoryMenuOpen, 'focus-ring': focusedIndex === 1 }]"
+                  @click="toggleCategoryMenu"
+                >
+                  <span class="md3-select-text">
+                    <span class="md3-select-label">分类</span>
+                    <span class="md3-select-value">{{ selectedCategoryLabel }}</span>
+                  </span>
+                  <span class="md3-select-icon" aria-hidden="true">▾</span>
+                </button>
+
+                <div class="md3-menu" v-if="categoryMenuOpen">
+                  <button
+                    v-for="(cat, idx) in categoryOptions"
+                    :key="String(cat.value || idx)"
+                    :data-category-index="idx"
+                    tabindex="0"
+                    type="button"
+                    :class="[
+                      'md3-menu-item',
+                      { selected: filters.category === cat.value, 'focus-ring': focusedIndex === idx + 4 },
+                    ]"
+                    @click="chooseCategory(idx)"
+                  >
+                    <span class="md3-menu-item-text">{{ cat.label }}</span>
+                    <span class="md3-menu-item-check" aria-hidden="true">{{ filters.category === cat.value ? "✓" : "" }}</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="md3-select-anchor">
+                <button
+                  id="catalog-sort-select"
+                  type="button"
+                  :class="['md3-select-field', { open: sortMenuOpen, 'focus-ring': focusedIndex === 2 }]"
+                  @click="toggleSortMenu"
+                >
+                  <span class="md3-select-text">
+                    <span class="md3-select-label">排序</span>
+                    <span class="md3-select-value">{{ selectedSortLabel }}</span>
+                  </span>
+                  <span class="md3-select-icon" aria-hidden="true">▾</span>
+                </button>
+
+                <div class="md3-menu" v-if="sortMenuOpen">
+                  <button
+                    v-for="(opt, idx) in sortOptions"
+                    :key="String(opt.value || idx)"
+                    :data-sort-index="idx"
+                    tabindex="0"
+                    type="button"
+                    :class="[
+                      'md3-menu-item',
+                      { selected: filters.sort === opt.value, 'focus-ring': focusedIndex === idx + 4 },
+                    ]"
+                    @click="chooseSort(idx)"
+                  >
+                    <span class="md3-menu-item-text">{{ opt.label }}</span>
+                    <span class="md3-menu-item-check" aria-hidden="true">{{ filters.sort === opt.value ? "✓" : "" }}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div class="library-toolbar-actions library-toolbar-actions-inline">
+              <button
+                id="emulator-button"
+                class="btn-secondary"
+                :class="{ 'focus-ring': focusedIndex === 3 }"
+                type="button"
+                @click="openEmulatorPage"
+              >
+                模拟器
+              </button>
+            </div>
+          </div>
+        </form>
+
+        <p class="hint">{{ hintText }}</p>
+      </template>
     </section>
 
-    <section class="results" v-if="showResults">
+    <section class="hero custom-hero" v-else>
+      <p class="hint">自定义源导入（支持 天翼云盘 / 百度网盘 / CTFile 分享链接，可选填访问码/提取码；CTFile token 请在设置页配置）</p>
+      <div class="custom-bar">
+        <button
+          id="custom-back"
+          :class="{ 'focus-ring': focusedIndex === 0 }"
+          type="button"
+          @click="switchView('library')"
+        >
+          返回
+        </button>
+        <input
+          id="custom-share-input"
+          v-model="customImport.share_url"
+          :class="{ 'focus-ring': focusedIndex === 1 }"
+          type="text"
+          placeholder="天翼：https://cloud.189.cn/t/xxxx | 百度：https://pan.baidu.com/s/1xxxx | CTFile：https://www.ctfile.com/f/xxxx 或 https://www.ctfile.com/d/xxxx"
+          autocomplete="off"
+          aria-label="分享链接"
+          @click="onTextInputClick('custom_share')"
+        />
+        <input
+          id="custom-pwd-input"
+          v-model="customImport.pwd"
+          :class="{ 'focus-ring': focusedIndex === 2 }"
+          type="text"
+          placeholder="访问码/密码（可选）"
+          autocomplete="off"
+          aria-label="访问码/密码"
+          @click="onTextInputClick('custom_pwd')"
+        />
+        <button
+          id="custom-parse-button"
+          :class="{ 'focus-ring': focusedIndex === 3 }"
+          type="button"
+          :disabled="customImport.loading || customImport.submitting"
+          @click="parseCustomImport"
+        >
+          {{ customImport.loading ? "解析中..." : "解析" }}
+        </button>
+      </div>
+      <p class="hint">{{ customImport.hintText }}</p>
+    </section>
+
+    <section class="results" v-if="view === 'library' && shouldShowResults">
       <div class="card-grid" v-if="list.items.length > 0">
         <article
-          :class="['game-card', { 'focus-ring': focusedIndex === idx + 2 }]"
+          :class="['game-card', { 'focus-ring': !isCatalogMenuOpen() && focusedIndex === idx + cardFocusStart }]"
           v-for="(item, idx) in list.items"
-          :key="item.game_id + item.down_url"
+          :key="item.group_key || item.game_id + item.down_url"
           :data-card-index="idx"
           tabindex="0"
           @click="openInstallConfirm(item)"
@@ -42,32 +217,108 @@
               loading="lazy"
               @error="onCoverError($event, item)"
             />
-          </div>
-          <div class="card-info">
-            <h3 class="card-title">{{ item.title }}</h3>
-            <div class="card-meta">
-              <span>{{ item.categories || "未分类" }}</span>
-              <span>{{ item.size_text || "-" }}</span>
+            <div class="card-overlay">
+              <h3 class="card-title">{{ item.title }}</h3>
+              <div class="card-meta">
+                <span>{{ item.categories || "未分类" }}</span>
+                <span>{{ cardSizeLabel(item) }}</span>
+              </div>
+            </div>
+            <div class="card-badge" v-if="item.variant_count && item.variant_count > 1">
+              {{ `${item.variant_count} 个版本` }}
             </div>
           </div>
         </article>
       </div>
 
+      <p class="empty" v-else-if="catalog.loading">正在加载游戏列表...</p>
       <p class="empty" v-else>没有匹配结果</p>
+
+      <div class="load-more-row" v-if="canLoadMore">
+        <button
+          id="load-more-button"
+          class="btn-secondary"
+          :class="{ 'focus-ring': !isCatalogMenuOpen() && focusedIndex === loadMoreFocusIndex }"
+          type="button"
+          @click="loadMoreBrowse"
+        >
+          加载更多
+        </button>
+      </div>
+    </section>
+
+    <section class="results" v-if="view === 'custom'">
+      <div class="custom-loading" v-if="customImport.loading">正在解析分享内容...</div>
+
+      <template v-else-if="customImport.plan">
+        <div class="custom-plan-meta">
+          <div><strong>分享ID</strong>：{{ customImport.plan.share_id || "-" }}</div>
+          <div><strong>文件数</strong>：{{ customImport.plan.file_count || (customImport.plan.files ? customImport.plan.files.length : 0) }}</div>
+          <div><strong>可用空间</strong>：{{ freeSpaceLabel(customImport.plan) }}</div>
+        </div>
+
+        <div class="custom-file-list" v-if="customImport.plan.files && customImport.plan.files.length > 0">
+          <article
+            v-for="(file, idx) in customImport.plan.files"
+            :key="String(file.file_id || idx)"
+            :data-file-index="idx"
+            tabindex="0"
+            :class="[
+              'custom-file-row',
+              { 'focus-ring': focusedIndex === idx + 4, selected: isCustomFileSelected(file) },
+            ]"
+            @click="toggleCustomFile(idx)"
+          >
+            <div class="custom-file-main">
+              <div class="custom-file-name">{{ file.name || "-" }}</div>
+              <div class="custom-file-meta">{{ formatBytes(file.size) }}</div>
+            </div>
+            <div class="custom-file-check">{{ isCustomFileSelected(file) ? "✓" : "" }}</div>
+          </article>
+        </div>
+
+        <div class="custom-actions">
+          <button
+            id="custom-download-button"
+            class="btn-primary"
+            :class="{ 'focus-ring': focusedIndex === customDownloadFocusIndex }"
+            type="button"
+            :disabled="customImport.submitting || customSelectedFileIds.length === 0"
+            @click="startCustomDownload"
+          >
+            {{ customImport.submitting ? "创建中..." : `下载选中（${customSelectedFileIds.length}）` }}
+          </button>
+          <button
+            id="custom-clear-button"
+            class="btn-secondary"
+            :class="{ 'focus-ring': focusedIndex === customClearFocusIndex }"
+            type="button"
+            :disabled="customImport.submitting"
+            @click="clearCustomSelection"
+          >
+            清空选择
+          </button>
+        </div>
+
+        <p class="hint" style="margin-top: 10px">
+          提示：如果是分卷压缩包（例如 .7z.001/.002 或 .part1.rar/.part2.rar），请把同一组分卷都选上。
+        </p>
+      </template>
+
+      <p class="empty" v-else>粘贴分享链接后点击解析。</p>
     </section>
 
     <p class="toast" v-if="message">{{ message }}</p>
 
     <section class="modal-mask" v-if="installDialog.visible">
       <div class="modal-card">
-        <div class="modal-loading" v-if="installDialog.loading">正在读取安装信息...</div>
+        <div class="modal-loading" v-if="installDialog.loading && !installDialog.plan">正在读取安装信息...</div>
 
         <template v-else-if="installDialog.plan">
           <div class="install-layout">
             <div class="modal-cover-panel">
               <div class="cover-art-anchor">
                 <div class="modal-cover-stage">
-                  <p class="cover-stage-caption">Freedeck</p>
                   <img
                     class="modal-cover"
                     :src="coverFor(installDialog.game || installDialog.plan)"
@@ -88,6 +339,41 @@
             </div>
             <div class="modal-side">
               <p class="modal-sub">确认后自动下载并解压安装</p>
+
+              <div class="md3-select-block" v-if="installDialog.variants && installDialog.variants.length > 1">
+                <div class="md3-select-anchor">
+                  <button
+                    id="install-version-select"
+                    type="button"
+                    :class="['md3-select-field', { open: installDialog.versionMenuOpen, 'focus-ring': focusedIndex === 2 }]"
+                    @click="toggleInstallVersionMenu"
+                  >
+                    <span class="md3-select-text">
+                      <span class="md3-select-label">版本</span>
+                      <span class="md3-select-value">{{ selectedInstallVersionLabel }}</span>
+                    </span>
+                    <span class="md3-select-icon" aria-hidden="true">▾</span>
+                  </button>
+
+                  <div class="md3-menu" v-if="installDialog.versionMenuOpen">
+                    <button
+                      v-for="(ver, vidx) in installDialog.variants"
+                      :key="String(ver.game_id || vidx) + String(ver.down_url || '')"
+                      :data-version-index="vidx"
+                      tabindex="0"
+                      type="button"
+                      :class="[
+                        'md3-menu-item',
+                        { selected: installDialog.selectedVariantIndex === vidx, 'focus-ring': focusedIndex === vidx + 3 },
+                      ]"
+                      @click="chooseInstallVersion(vidx)"
+                    >
+                      <span class="md3-menu-item-text">{{ installVersionLabel(ver, vidx) }}</span>
+                      <span class="md3-menu-item-check" aria-hidden="true">{{ installDialog.selectedVariantIndex === vidx ? "✓" : "" }}</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
 
               <div class="space-block">
                 <div class="space-row">
@@ -132,7 +418,7 @@
     </section>
   </main>
 
-  <script src="/tianyi/library/vue.global.prod.js"></script>
-  <script src="/tianyi/library/app.js"></script>
+  <script src="/tianyi/library/vue.global.prod.js?v=20260312_1"></script>
+  <script src="/tianyi/library/app.js?v=20260312_1"></script>
 </body>
 </html>

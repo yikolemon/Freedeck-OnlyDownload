@@ -10,14 +10,16 @@ import html
 import json
 import logging
 import os
+import platform
 import re
 import ssl
 import subprocess
+import shutil
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, unquote
 
 try:
     # 某些 Decky 运行环境可能缺少 xml 标准库子模块，做兼容降级。
@@ -54,6 +56,94 @@ _JS_CLOUD_UPLOAD_RELATIVE_PATHS: Tuple[Tuple[str, str], ...] = (
     ("backend", "tianyi_cloud_upload.js"),
     ("backend", "tianyi_cloud_upload.cjs"),
 )
+_NODE_BIN_CACHE = ""
+_SHARE_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{4,}$")
+
+
+def _ensure_executable(path: str) -> None:
+    """确保二进制具备可执行权限（避免 zip/安装丢失可执行位）。"""
+    target = str(path or "").strip()
+    if not target:
+        return
+    try:
+        mode = os.stat(target).st_mode
+        if mode & 0o111:
+            return
+        os.chmod(target, mode | 0o755)
+    except Exception:
+        return
+
+
+def _resolve_node_binary() -> str:
+    """解析可用的 node 运行时路径。
+
+    优先级：
+    1) 环境变量 `FREDECK_NODE_BIN`
+    2) 插件内置 `defaults/node/<arch>/node`
+    3) 系统 `node`（PATH）
+    """
+    global _NODE_BIN_CACHE
+    cached = str(_NODE_BIN_CACHE or "").strip()
+    if cached:
+        return cached
+
+    override = str(os.environ.get("FREDECK_NODE_BIN", "") or "").strip()
+    if override:
+        resolved = os.path.realpath(os.path.expanduser(override))
+        if os.path.isfile(resolved):
+            _ensure_executable(resolved)
+            _NODE_BIN_CACHE = resolved
+            return resolved
+
+    roots: List[Path] = []
+    plugin_dir = str(os.environ.get("DECKY_PLUGIN_DIR", "") or "").strip()
+    if plugin_dir:
+        try:
+            roots.append(Path(plugin_dir).resolve())
+        except Exception:
+            pass
+    try:
+        roots.append(Path(__file__).resolve().parents[1])
+    except Exception:
+        pass
+
+    seen: set[str] = set()
+    ordered_roots: List[Path] = []
+    for root in roots:
+        key = str(root)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered_roots.append(root)
+
+    machine = str(platform.machine() or "").lower()
+    relative_candidates: List[Tuple[str, ...]] = []
+    if machine in {"x86_64", "amd64"}:
+        relative_candidates.append(("defaults", "node", "linux-x64", "node"))
+    if machine in {"aarch64", "arm64"}:
+        relative_candidates.append(("defaults", "node", "linux-arm64", "node"))
+    relative_candidates.extend(
+        [
+            ("defaults", "node", "node"),
+            ("defaults", "node", "bin", "node"),
+        ]
+    )
+
+    for root in ordered_roots:
+        for rel in relative_candidates:
+            candidate = root.joinpath(*rel)
+            try:
+                if candidate.is_file():
+                    resolved = str(candidate)
+                    _ensure_executable(resolved)
+                    _NODE_BIN_CACHE = resolved
+                    return resolved
+            except Exception:
+                continue
+
+    system = shutil.which("node") or "node"
+    _NODE_BIN_CACHE = system
+    return system
 
 @dataclass
 class ResolvedFile:
@@ -185,18 +275,80 @@ def parse_share_url(share_url: str) -> Tuple[str, str]:
     raw = (share_url or "").strip()
     if not raw:
         raise TianyiApiError("分享链接为空")
+
+    def _looks_like_share_code(text: str) -> bool:
+        candidate = str(text or "").strip()
+        if not candidate:
+            return False
+        if any(ch in candidate for ch in ("/", "?", "&", "#", " ")):
+            return False
+        return bool(_SHARE_CODE_RE.fullmatch(candidate))
+
+    # 允许用户仅粘贴 shareCode（例如聊天里单独发的短码）。
+    if _looks_like_share_code(raw):
+        return raw, ""
+
+    # 允许缺少 scheme 的链接，例如 cloud.189.cn/t/xxxx?pwd=yyyy
+    if raw.startswith(("cloud.189.cn/", "www.cloud.189.cn/", "m.cloud.189.cn/", "h5.cloud.189.cn/")):
+        raw = "https://" + raw
+
     parsed = urlparse(raw)
     host = (parsed.netloc or "").lower()
-    if host not in {"cloud.189.cn", "www.cloud.189.cn"}:
+    allowed_hosts = {
+        "cloud.189.cn",
+        "www.cloud.189.cn",
+        "m.cloud.189.cn",
+        "h5.cloud.189.cn",
+    }
+    if host and host not in allowed_hosts:
         raise TianyiApiError("链接格式无效，仅支持 cloud.189.cn 分享链接")
+    if not host:
+        # 尝试从文本中提取分享链接/参数（避免用户粘贴了多余文案）。
+        m = re.search(r"(https?://[^\s]+)", raw)
+        if m:
+            return parse_share_url(m.group(1))
+        raise TianyiApiError("链接格式无效，仅支持 cloud.189.cn 分享链接")
+
     path_parts = [part for part in (parsed.path or "").split("/") if part]
-    if len(path_parts) < 2 or path_parts[0] != "t":
-        raise TianyiApiError("链接格式无效，缺少 shareCode")
-    share_code = path_parts[1].strip()
-    if not share_code:
-        raise TianyiApiError("链接格式无效，shareCode 为空")
     qs = parse_qs(parsed.query or "", keep_blank_values=True)
-    pwd = (qs.get("pwd", [""])[0] or "").strip()
+
+    def _get_first_param(source: Dict[str, List[str]], keys: Sequence[str]) -> str:
+        lower_map = {str(k).strip().lower(): v for k, v in source.items()}
+        for key in keys:
+            name = str(key).strip().lower()
+            values = source.get(key) or lower_map.get(name) or []
+            if not values:
+                continue
+            value = str(values[0] or "").strip()
+            if value:
+                return value
+        return ""
+
+    pwd = _get_first_param(qs, ("pwd", "accessCode", "accesscode", "access_code"))
+
+    share_code = ""
+    if len(path_parts) >= 2 and path_parts[0] in {"t", "s"}:
+        share_code = str(path_parts[1] or "").strip()
+    if not share_code:
+        # 兼容 web/share?code=xxxx、shareCode=xxxx、以及接口链接参数 shareCode=xxxx
+        share_code = _get_first_param(qs, ("shareCode", "sharecode", "share_code", "code"))
+    if not share_code and path_parts:
+        # 兜底：在 path 中寻找 /t/<code> 或 /s/<code>
+        for idx, part in enumerate(path_parts):
+            if part in {"t", "s"} and idx + 1 < len(path_parts):
+                share_code = str(path_parts[idx + 1] or "").strip()
+                if share_code:
+                    break
+
+    share_code = unquote(str(share_code or "").strip())
+    pwd = unquote(str(pwd or "").strip())
+
+    if not share_code:
+        raise TianyiApiError("链接格式无效，缺少 shareCode（示例：https://cloud.189.cn/t/xxxx 或 https://cloud.189.cn/web/share?code=xxxx）")
+    if not _looks_like_share_code(share_code):
+        # 仅做弱校验：避免明显错误导致后续接口链路浪费时间。
+        raise TianyiApiError("链接格式无效，shareCode 不合法")
+
     return share_code, pwd
 
 
@@ -704,10 +856,11 @@ async def _resolve_share_via_js(share_url: str, cookie: str) -> ResolvedShare:
         return env
 
     node_env = _build_node_env()
+    node_bin = _resolve_node_binary()
 
     def _run_node() -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
-            ["node", script_path],
+            [node_bin, script_path],
             input=payload,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -719,7 +872,7 @@ async def _resolve_share_via_js(share_url: str, cookie: str) -> ResolvedShare:
     try:
         completed = await asyncio.to_thread(_run_node)
     except FileNotFoundError as exc:
-        raise TianyiApiError("系统缺少 node 运行时，无法启用 JS 解析器") from exc
+        raise TianyiApiError("未找到可用 Node 运行时，无法启用 JS 解析器") from exc
     except subprocess.TimeoutExpired as exc:
         raise TianyiApiError("JS 解析器执行超时") from exc
     except Exception as exc:
@@ -1071,8 +1224,6 @@ async def resolve_share(share_url: str, cookie: str) -> ResolvedShare:
                     checked_share_id = _get_json_value(payload, "shareId", "shareID", "shareid")
                     if checked_share_id:
                         share_id = checked_share_id
-                        if not root_file_id:
-                            root_file_id = checked_share_id
                     detail = _extract_api_error(payload)
                     ok = bool(checked_share_id)
                     _append_attempt(
@@ -1089,7 +1240,7 @@ async def resolve_share(share_url: str, cookie: str) -> ResolvedShare:
                         body_type=str(meta.get("body_type", "")),
                         body_preview=str(meta.get("body_preview", "")),
                     )
-                    if ok:
+                    if ok and root_file_id:
                         break
                     last_share_error = detail or "未返回shareId"
                 except TianyiApiError as exc:
@@ -1129,7 +1280,7 @@ async def resolve_share(share_url: str, cookie: str) -> ResolvedShare:
         )
 
         for step_name, req_params in info_param_sets:
-            if share_id:
+            if share_id and root_file_id:
                 break
             for profile in _SHARE_INFO_PROFILES:
                 try:
@@ -1179,7 +1330,7 @@ async def resolve_share(share_url: str, cookie: str) -> ResolvedShare:
                     )
                     last_share_error = str(exc)
 
-                if share_id:
+                if share_id and root_file_id:
                     break
 
         # 2) HTML 兜底：从分享落地页提取 shareId。
@@ -1334,10 +1485,12 @@ async def resolve_share(share_url: str, cookie: str) -> ResolvedShare:
             "pageSize": "60",
         }
         if is_folder:
+            # 对齐 GameBox：目录分享优先用 shareId 作为根目录 ID（避免 fileId 解析不稳定导致只返回部分分卷）。
+            list_root = share_id
             params.update(
                 {
-                    "fileId": share_id or root_file_id,
-                    "shareDirFileId": share_id or root_file_id,
+                    "fileId": list_root,
+                    "shareDirFileId": list_root,
                     "isFolder": "true",
                     "orderBy": "lastOpTime",
                     "descending": "true",
@@ -1349,10 +1502,51 @@ async def resolve_share(share_url: str, cookie: str) -> ResolvedShare:
         # 无提取码分享也保留 accessCode 参数，兼容部分接口行为。
         params["accessCode"] = pwd
 
-        async def _request_list_payload(list_params: Dict[str, str], *, step_name: str) -> Dict[str, object]:
+        preferred_list_profile: Optional[ShareRequestProfile] = None
+
+        def _list_payload_row_count(payload: Dict[str, object]) -> int:
+            file_list_ao = _find_nested_value(payload, "fileListAO")
+            candidate = file_list_ao.get("fileList") if isinstance(file_list_ao, dict) else None
+            if isinstance(candidate, list):
+                return sum(1 for row in candidate if isinstance(row, dict))
+            nested = _find_nested_value(payload, "fileList", "files", "rows", "list")
+            if isinstance(nested, list):
+                return sum(1 for row in nested if isinstance(row, dict))
+            return 0
+
+        def _list_payload_total_count(payload: Dict[str, object]) -> int:
+            file_list_ao = _find_nested_value(payload, "fileListAO")
+            if isinstance(file_list_ao, dict):
+                for key in ("count", "totalCount", "recordCount", "total", "fileCount"):
+                    parsed = _parse_int(file_list_ao.get(key), 0)
+                    if parsed > 0:
+                        return parsed
+            for key in ("totalCount", "recordCount", "count", "total", "fileCount"):
+                parsed = _parse_int(_find_nested_value(payload, key), 0)
+                if parsed > 0:
+                    return parsed
+            return 0
+
+        async def _request_list_payload(
+            list_params: Dict[str, str],
+            *,
+            step_name: str,
+            probe_all: bool = False,
+        ) -> Dict[str, object]:
+            nonlocal preferred_list_profile
             last_error: Optional[TianyiApiError] = None
             last_message = "listShareDir 请求失败"
+            successes: List[Tuple[int, int, ShareRequestProfile, Dict[str, object]]] = []
+
+            ordered_profiles: List[ShareRequestProfile] = []
+            if preferred_list_profile is not None:
+                ordered_profiles.append(preferred_list_profile)
             for profile in _SHARE_LIST_PROFILES:
+                if preferred_list_profile is not None and profile is preferred_list_profile:
+                    continue
+                ordered_profiles.append(profile)
+
+            for profile in ordered_profiles:
                 try:
                     payload, meta = await _request_share_profile(
                         session,
@@ -1365,6 +1559,8 @@ async def resolve_share(share_url: str, cookie: str) -> ResolvedShare:
                     )
                     detail = _extract_api_error(payload)
                     ok = _is_success(payload)
+                    row_count = _list_payload_row_count(payload) if ok else 0
+                    total_count = _list_payload_total_count(payload) if ok else 0
                     _append_attempt(
                         attempts,
                         step=step_name,
@@ -1380,8 +1576,16 @@ async def resolve_share(share_url: str, cookie: str) -> ResolvedShare:
                         body_preview=str(meta.get("body_preview", "")),
                     )
                     if ok:
-                        return payload
-                    last_message = detail or "响应未标记成功"
+                        successes.append((row_count, total_count, profile, payload))
+                        # 命中偏好 profile 时，如果结果已经足够完整，直接返回，避免额外探测。
+                        if preferred_list_profile is not None and profile is preferred_list_profile and not probe_all:
+                            if total_count > 0 and row_count >= total_count:
+                                return payload
+                            if row_count >= 6:
+                                return payload
+                            # 行数太少时继续尝试其他 profile，防止“只拿到部分分卷”。
+                    if not ok:
+                        last_message = detail or "响应未标记成功"
                 except TianyiApiError as exc:
                     diag = exc.diagnostics if isinstance(exc.diagnostics, dict) else {}
                     _append_attempt(
@@ -1400,6 +1604,17 @@ async def resolve_share(share_url: str, cookie: str) -> ResolvedShare:
                     )
                     last_error = exc
                     last_message = str(exc)
+
+                if successes and not probe_all and preferred_list_profile is None:
+                    # 首次成功时允许继续探测一次，找更完整的响应（最多 3 个 profile）。
+                    continue
+
+            # 选择文件行数最多的结果作为“最佳” payload，并锁定后续分页使用。
+            if successes:
+                successes.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                best = successes[0]
+                preferred_list_profile = best[2]
+                return best[3]
 
             if last_error is not None:
                 raise TianyiApiError(last_message, diagnostics={"attempts": attempts}) from last_error
@@ -1497,22 +1712,376 @@ async def resolve_share(share_url: str, cookie: str) -> ResolvedShare:
                     diagnostics={"share_code": share_code, "share_url": share_url, "attempts": attempts},
                 ) from first_error
 
-        file_list_ao = _find_nested_value(list_payload, "fileListAO")
-        rows: object = file_list_ao.get("fileList") if isinstance(file_list_ao, dict) else None
-        if not isinstance(rows, list):
-            rows = _find_nested_value(list_payload, "fileList", "files", "rows", "list")
-        files: List[ResolvedFile] = []
-        if isinstance(rows, list):
-            for row in rows:
+        # 目录分享：即使 listShareDir 成功，也可能因为根目录参数差异返回的文件数不同（尤其是分卷压缩包）。
+        # 当 shareId-root 的结果明显偏少时，尝试用 root_file_id 再拉一次，并选择文件行数更多的结果。
+        if is_folder and root_file_id and root_file_id != params.get("fileId"):
+            try:
+                current_rows = _list_payload_row_count(list_payload)
+                current_total = _list_payload_total_count(list_payload)
+                should_probe_alt = bool(current_rows <= 2 or (current_total > 0 and current_rows < current_total))
+                if should_probe_alt:
+                    alt_params = dict(params)
+                    alt_params["fileId"] = root_file_id
+                    alt_params["shareDirFileId"] = root_file_id
+                    alt_params["noCache"] = str(_now_ms())
+                    alt_payload = await _request_list_payload(
+                        alt_params,
+                        step_name="list_share_dir_probe_root_file_id",
+                        probe_all=True,
+                    )
+                    alt_rows = _list_payload_row_count(alt_payload)
+                    alt_total = _list_payload_total_count(alt_payload)
+                    if (alt_rows, alt_total) > (current_rows, current_total):
+                        params = alt_params
+                        list_payload = alt_payload
+            except Exception:
+                pass
+
+        def _extract_rows(payload: Dict[str, object]) -> List[Dict[str, object]]:
+            file_list_ao = _find_nested_value(payload, "fileListAO")
+            candidate = file_list_ao.get("fileList") if isinstance(file_list_ao, dict) else None
+            if isinstance(candidate, list):
+                return [row for row in candidate if isinstance(row, dict)]
+            nested = _find_nested_value(payload, "fileList", "files", "rows", "list")
+            if isinstance(nested, list):
+                return [row for row in nested if isinstance(row, dict)]
+            return []
+
+        def _extract_total_count(payload: Dict[str, object]) -> int:
+            file_list_ao = _find_nested_value(payload, "fileListAO")
+            if isinstance(file_list_ao, dict):
+                for key in ("count", "totalCount", "recordCount", "total", "fileCount"):
+                    parsed = _parse_int(file_list_ao.get(key), 0)
+                    if parsed > 0:
+                        return parsed
+            for key in ("totalCount", "recordCount", "count", "total", "fileCount"):
+                parsed = _parse_int(_find_nested_value(payload, key), 0)
+                if parsed > 0:
+                    return parsed
+            return 0
+
+        def _row_file_id(row: Dict[str, object]) -> str:
+            return str(_get_json_value(row, "id", "fileId") or "").strip()
+
+        def _row_is_folder(row: Dict[str, object]) -> bool:
+            return str(row.get("isFolder", "")).strip().lower() in {"1", "true"}
+
+        def _merge_unique_rows(
+            *,
+            target: List[Dict[str, object]],
+            incoming: List[Dict[str, object]],
+            seen: set,
+        ) -> int:
+            added = 0
+            for row in incoming:
                 if not isinstance(row, dict):
                     continue
-                file_id = _get_json_value(row, "id", "fileId")
-                if not file_id:
+                file_id = _row_file_id(row)
+                if not file_id or file_id in seen:
                     continue
-                name = _get_json_value(row, "name", "fileName") or f"file-{file_id}"
-                size = _parse_int(row.get("size", row.get("fileSize", 0)), 0)
-                folder = str(row.get("isFolder", "")).lower() in {"1", "true"}
-                files.append(ResolvedFile(file_id=file_id, name=name, size=size, is_folder=folder))
+                seen.add(file_id)
+                target.append(row)
+                added += 1
+            return added
+
+        async def _collect_rows_for_payload(
+            *,
+            first_payload: Dict[str, object],
+            base_params: Dict[str, str],
+            step_prefix: str,
+        ) -> List[Dict[str, object]]:
+            collected: List[Dict[str, object]] = []
+            seen: set = set()
+
+            page_num = max(1, _parse_int(base_params.get("pageNum"), 1))
+            max_pages = 200
+            consecutive_no_new = 0
+
+            current_payload = first_payload
+            total_count = _extract_total_count(first_payload)
+            first_page_rows = _extract_rows(first_payload)
+
+            folder_flag = str(base_params.get("isFolder", "")).strip().lower() in {"1", "true"}
+            should_paginate_local = bool(
+                folder_flag or (total_count > 0 and len(first_page_rows) < total_count)
+            )
+            if not should_paginate_local:
+                _merge_unique_rows(target=collected, incoming=first_page_rows, seen=seen)
+                return collected
+
+            while True:
+                page_rows = _extract_rows(current_payload)
+                if total_count <= 0:
+                    total_count = _extract_total_count(current_payload)
+
+                new_added = _merge_unique_rows(target=collected, incoming=page_rows, seen=seen)
+
+                if not page_rows:
+                    break
+                if total_count > 0 and len(seen) >= total_count:
+                    break
+                if new_added == 0:
+                    consecutive_no_new += 1
+                    if consecutive_no_new >= 2:
+                        break
+                else:
+                    consecutive_no_new = 0
+
+                page_num += 1
+                if page_num > max_pages:
+                    break
+                next_params = dict(base_params)
+                next_params["pageNum"] = str(page_num)
+                next_params["noCache"] = str(_now_ms())
+                current_payload = await _request_list_payload(
+                    next_params,
+                    step_name=f"{step_prefix}_page_{page_num}",
+                    probe_all=False,
+                )
+
+            return collected
+
+        rows: List[Dict[str, object]] = []
+        first_rows = _extract_rows(list_payload)
+        first_total = _extract_total_count(list_payload)
+
+        # 兼容：部分分享会错误标记 isFolder=false，导致只拿到部分文件（尤其是分卷压缩包）。
+        # 当结果很少或包含文件夹条目时，尝试强制按文件夹方式重新拉取。
+        if not is_folder:
+            looks_like_folder = False
+            try:
+                looks_like_folder = any(
+                    str((row or {}).get("isFolder", "")).strip().lower() in {"1", "true"} for row in first_rows
+                )
+            except Exception:
+                looks_like_folder = False
+
+            should_force_folder = bool(looks_like_folder or (len(first_rows) <= 2 and bool(root_file_id)))
+            if should_force_folder:
+                folder_params = dict(params)
+                # 对齐 GameBox：目录根优先使用 shareId（root_file_id 在部分分享里不稳定，可能导致只返回部分分卷）。
+                folder_root = str(share_id or folder_params.get("fileId") or root_file_id or "")
+                folder_params.update(
+                    {
+                        "fileId": folder_root,
+                        "shareDirFileId": folder_root,
+                        "isFolder": "true",
+                        "orderBy": "lastOpTime",
+                        "descending": "true",
+                        "pageNum": "1",
+                        "pageSize": "60",
+                        "noCache": str(_now_ms()),
+                    }
+                )
+                try:
+                    folder_payload = await _request_list_payload(
+                        folder_params,
+                        step_name="list_share_dir_force_folder",
+                        probe_all=True,
+                    )
+                    folder_rows = _extract_rows(folder_payload)
+                    if len(folder_rows) > len(first_rows):
+                        is_folder = True
+                        params = folder_params
+                        list_payload = folder_payload
+                        first_rows = folder_rows
+                        first_total = _extract_total_count(folder_payload)
+                except TianyiApiError:
+                    pass
+
+        should_paginate = bool(is_folder or (first_total > 0 and len(first_rows) < first_total))
+        if should_paginate:
+            # 目录分享/多文件分享都可能存在分页；必须拉取完整分页，否则分卷压缩包会出现“需要点多次才凑齐分卷”的问题。
+            page_num = max(1, _parse_int(params.get("pageNum"), 1))
+            max_pages = 200
+            seen_file_ids: set = set()
+            total_count = first_total
+            consecutive_no_new = 0
+            current_payload = list_payload
+
+            while True:
+                page_rows = _extract_rows(current_payload)
+                if total_count <= 0:
+                    total_count = _extract_total_count(current_payload)
+
+                new_added = 0
+                for row in page_rows:
+                    file_id = _get_json_value(row, "id", "fileId")
+                    if not file_id or file_id in seen_file_ids:
+                        continue
+                    seen_file_ids.add(file_id)
+                    rows.append(row)
+                    new_added += 1
+
+                if not page_rows:
+                    break
+                if total_count > 0 and len(seen_file_ids) >= total_count:
+                    break
+                if new_added == 0:
+                    consecutive_no_new += 1
+                    if consecutive_no_new >= 2:
+                        break
+                else:
+                    consecutive_no_new = 0
+
+                page_num += 1
+                if page_num > max_pages:
+                    break
+                next_params = dict(params)
+                next_params["pageNum"] = str(page_num)
+                next_params["noCache"] = str(_now_ms())
+                try:
+                    current_payload = await _request_list_payload(
+                        next_params,
+                        step_name=f"list_share_dir_page_{page_num}",
+                    )
+                except TianyiApiError as page_error:
+                    try:
+                        js_resolved = await _resolve_share_via_js(share_url, cookie)
+                        _append_attempt(
+                            attempts,
+                            step="js_fallback_on_list_pagination_error",
+                            endpoint="/backend/tianyi_share_resolver.js",
+                            ok=True,
+                            share_id=js_resolved.share_id,
+                            host="local_js_resolver",
+                            method="NODE",
+                            profile="gamebox_like_js",
+                            message=f"python_list_page_failed: {page_error}",
+                        )
+                        return js_resolved
+                    except TianyiApiError as js_exc:
+                        js_list_error = str(js_exc)
+                        _append_attempt(
+                            attempts,
+                            step="js_fallback_on_list_pagination_error",
+                            endpoint="/backend/tianyi_share_resolver.js",
+                            ok=False,
+                            host="local_js_resolver",
+                            method="NODE",
+                            profile="gamebox_like_js",
+                            message=js_list_error,
+                        )
+                    raise
+        else:
+            rows = first_rows
+
+        # 进一步兜底：部分分享的 listShareDir 返回不稳定（同一分享多次请求返回的文件数不同）。
+        # 这里对“小目录”做 1~2 次重拉取并按 fileId 合并，避免用户需要手动点多次才凑齐分卷。
+        seen_ids: set = set()
+        for row in list(rows):
+            if not isinstance(row, dict):
+                continue
+            fid = _row_file_id(row)
+            if fid:
+                seen_ids.add(fid)
+
+        try:
+            folder_like = bool(is_folder) or any(_row_is_folder(row) for row in rows if isinstance(row, dict))
+        except Exception:
+            folder_like = bool(is_folder)
+
+        if folder_like and rows and len(rows) <= 40:
+            for attempt in range(1, 3):
+                relist_params = dict(params)
+                relist_params["noCache"] = str(_now_ms())
+                relist_params["pageNum"] = "1"
+                try:
+                    relist_payload = await _request_list_payload(
+                        relist_params,
+                        step_name=f"list_share_dir_relist_{attempt}",
+                        probe_all=True,
+                    )
+                    relist_rows = await _collect_rows_for_payload(
+                        first_payload=relist_payload,
+                        base_params=relist_params,
+                        step_prefix=f"list_share_dir_relist_{attempt}",
+                    )
+                    added = _merge_unique_rows(target=rows, incoming=relist_rows, seen=seen_ids)
+                    if added <= 0:
+                        break
+                except Exception:
+                    break
+
+        # 如果目录里包含子文件夹，但根目录没有足够的文件，递归拉取部分子目录内容。
+        try:
+            non_folder_count = sum(
+                1 for row in rows if isinstance(row, dict) and not _row_is_folder(row)
+            )
+        except Exception:
+            non_folder_count = 0
+
+        folder_ids: List[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if not _row_is_folder(row):
+                continue
+            fid = _row_file_id(row)
+            if fid:
+                folder_ids.append(fid)
+
+        if folder_ids and non_folder_count <= 4:
+            visited_folders: set = set()
+            queue: List[Tuple[str, int]] = [(fid, 1) for fid in folder_ids[:6]]
+            max_depth = 3
+            max_folders = 12
+            max_total_rows = 800
+
+            while queue and len(visited_folders) < max_folders and len(rows) < max_total_rows:
+                folder_id, depth = queue.pop(0)
+                if not folder_id or folder_id in visited_folders:
+                    continue
+                visited_folders.add(folder_id)
+
+                folder_params = dict(params)
+                folder_params.update(
+                    {
+                        "fileId": folder_id,
+                        "shareDirFileId": folder_id,
+                        "isFolder": "true",
+                        "orderBy": "lastOpTime",
+                        "descending": "true",
+                        "pageNum": "1",
+                        "pageSize": "60",
+                        "noCache": str(_now_ms()),
+                    }
+                )
+                try:
+                    folder_payload = await _request_list_payload(
+                        folder_params,
+                        step_name=f"list_share_dir_sub_{depth}_{len(visited_folders)}",
+                        probe_all=False,
+                    )
+                    folder_rows = await _collect_rows_for_payload(
+                        first_payload=folder_payload,
+                        base_params=folder_params,
+                        step_prefix=f"list_share_dir_sub_{depth}_{len(visited_folders)}",
+                    )
+                except Exception:
+                    continue
+
+                _merge_unique_rows(target=rows, incoming=folder_rows, seen=seen_ids)
+
+                if depth < max_depth:
+                    for sub_row in folder_rows:
+                        if not isinstance(sub_row, dict):
+                            continue
+                        if not _row_is_folder(sub_row):
+                            continue
+                        sub_id = _row_file_id(sub_row)
+                        if sub_id and sub_id not in visited_folders:
+                            queue.append((sub_id, depth + 1))
+
+        files: List[ResolvedFile] = []
+        for row in rows:
+            file_id = _get_json_value(row, "id", "fileId")
+            if not file_id:
+                continue
+            name = _get_json_value(row, "name", "fileName") or f"file-{file_id}"
+            size = _parse_int(row.get("size", row.get("fileSize", 0)), 0)
+            folder = str(row.get("isFolder", "")).lower() in {"1", "true"}
+            files.append(ResolvedFile(file_id=file_id, name=name, size=size, is_folder=folder))
 
         if not files and root_file_id:
             files.append(
@@ -1577,45 +2146,76 @@ async def fetch_download_url(
     file_id: str,
 ) -> str:
     """获取官方文件下载直链。"""
-    timestamp = str(_now_ms())
-    sign_source = (
-        f"AccessToken={access_token}&Timestamp={timestamp}&dt=1&fileId={file_id}&shareId={share_id}"
-    )
-    signature = hashlib.md5(sign_source.encode("utf-8")).hexdigest()
-    url = (
-        "https://api.cloud.189.cn/open/file/getFileDownloadUrl.action?"
-        + urlencode({"fileId": file_id, "dt": "1", "shareId": share_id})
-    )
+    query = urlencode({"fileId": file_id, "dt": "1", "shareId": share_id})
+    url_candidates = [
+        "https://api.cloud.189.cn/open/file/getFileDownloadUrl.action?" + query,
+        "https://cloud.189.cn/api/open/file/getFileDownloadUrl.action?" + query,
+    ]
 
     timeout = aiohttp.ClientTimeout(total=20)
     headers = _headers(cookie)
     headers.update(
         {
             "Accesstoken": access_token,
-            "Signature": signature,
-            "Timestamp": timestamp,
             "Sign-Type": "1",
             "Accept": "application/json;charset=UTF-8",
         }
     )
 
     async with _create_session(timeout=timeout) as session:
-        try:
-            async with session.get(url, headers=headers, allow_redirects=False) as resp:
-                if resp.status >= 400:
-                    text = (await resp.text())[:280]
-                    raise TianyiApiError(f"直链请求失败 status={resp.status} body={text}")
+        transient_statuses = {429, 500, 502, 503, 504}
+        last_error: Optional[BaseException] = None
+        payload: Optional[Dict[str, object]] = None
+
+        for attempt in range(1, 4):
+            for url in url_candidates:
+                timestamp = str(_now_ms())
+                sign_source = (
+                    f"AccessToken={access_token}&Timestamp={timestamp}&dt=1&fileId={file_id}&shareId={share_id}"
+                )
+                signature = hashlib.md5(sign_source.encode("utf-8")).hexdigest()
+                headers["Signature"] = signature
+                headers["Timestamp"] = timestamp
+
                 try:
-                    payload = await resp.json(content_type=None)
-                except Exception as exc:
-                    text = (await resp.text())[:280]
-                    raise TianyiApiError(f"直链响应解析失败: {exc}; body={text}") from exc
-        except aiohttp.ClientConnectorCertificateError as exc:
-            raise TianyiApiError(f"TLS证书校验失败: {exc}") from exc
-        except aiohttp.ClientSSLError as exc:
-            raise TianyiApiError(f"TLS连接失败: {exc}") from exc
-        except aiohttp.ClientError as exc:
-            raise TianyiApiError(f"网络请求失败: {exc}") from exc
+                    async with session.get(url, headers=headers, allow_redirects=False) as resp:
+                        raw_text = await resp.text()
+                        if resp.status >= 400:
+                            preview = raw_text[:280]
+                            if resp.status in transient_statuses:
+                                last_error = TianyiApiError(
+                                    f"直链请求失败 status={resp.status} body={preview}"
+                                )
+                                continue
+                            raise TianyiApiError(f"直链请求失败 status={resp.status} body={preview}")
+
+                        parsed = _normalize_json_payload(raw_text)
+                        if not isinstance(parsed, dict):
+                            raise TianyiApiError(
+                                f"直链响应格式异常 type={type(parsed).__name__}"
+                            )
+                        payload = parsed
+                        last_error = None
+                        break
+                except (aiohttp.ClientConnectorCertificateError, aiohttp.ClientSSLError) as exc:
+                    last_error = TianyiApiError(f"TLS连接失败: {exc}")
+                    continue
+                except aiohttp.ClientError as exc:
+                    last_error = TianyiApiError(f"网络请求失败: {exc}")
+                    continue
+                except TianyiApiError as exc:
+                    last_error = exc
+                    continue
+
+            if payload is not None:
+                break
+            if attempt < 3:
+                await asyncio.sleep(min(2.0, 0.4 * (2 ** (attempt - 1))))
+
+        if payload is None:
+            if last_error is not None:
+                raise TianyiApiError(str(last_error)) from last_error
+            raise TianyiApiError("直链请求失败：未知错误")
 
     if not isinstance(payload, dict):
         raise TianyiApiError("直链响应格式异常")
@@ -1882,10 +2482,11 @@ async def _invoke_cloud_helper_via_js(
         return env
 
     node_env = _build_node_env()
+    node_bin = _resolve_node_binary()
 
     def _run_node() -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
-            ["node", script_path],
+            [node_bin, script_path],
             input=raw_payload,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1897,7 +2498,7 @@ async def _invoke_cloud_helper_via_js(
     try:
         completed = await asyncio.to_thread(_run_node)
     except FileNotFoundError as exc:
-        raise TianyiApiError("系统缺少 node 运行时，无法执行云上传") from exc
+        raise TianyiApiError("未找到可用 Node 运行时，无法执行云上传") from exc
     except subprocess.TimeoutExpired as exc:
         raise TianyiApiError("云上传执行超时") from exc
     except Exception as exc:

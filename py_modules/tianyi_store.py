@@ -49,15 +49,41 @@ class TianyiLoginState:
 
 
 @dataclass
+class BaiduLoginState:
+    """百度网盘登录态。"""
+
+    cookie: str = ""
+    user_account: str = ""
+    updated_at: int = 0
+
+
+@dataclass
+class CtfileLoginState:
+    """城通网盘（CTFile）登录态（session_id token）。"""
+
+    token: str = ""
+    updated_at: int = 0
+
+
+@dataclass
 class TianyiSettings:
     """下载相关设置。"""
 
     download_dir: str = ""
     install_dir: str = ""
+    emulator_dir: str = ""
     split_count: int = 16
+    aria2_fast_mode: bool = False
+    force_ipv4: bool = True
+    auto_switch_line: bool = True
     page_size: int = 50
     auto_delete_package: bool = False
     auto_install: bool = True
+    lsfg_enabled: bool = False
+    show_playtime_widget: bool = True
+    cloud_save_auto_upload: bool = False
+    steamgriddb_enabled: bool = False
+    steamgriddb_api_key: str = ""
 
 
 @dataclass
@@ -72,15 +98,24 @@ class TianyiTaskRecord:
     share_id: str
     file_id: str
     file_name: str
+    file_size: int
     download_dir: str
     local_path: str
     status: str
     progress: float
     speed: int
+    provider: str = "tianyi"
+    share_url: str = ""
+    share_ctx: Dict[str, Any] = field(default_factory=dict)
+    notice: str = ""
     openpath: str = ""
     install_status: str = "pending"
+    install_progress: float = 0.0
     install_message: str = ""
     installed_path: str = ""
+    steam_import_status: str = "pending"
+    steam_exe_candidates: List[str] = field(default_factory=list)
+    steam_exe_selected: str = ""
     post_processed: bool = False
     error_reason: str = ""
     created_at: int = field(default_factory=_now_ts)
@@ -89,15 +124,40 @@ class TianyiTaskRecord:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TianyiTaskRecord":
         """从字典恢复任务对象。"""
+        install_progress = float(data.get("install_progress", 0.0) or 0.0)
+        if not (install_progress >= 0.0):
+            install_progress = 0.0
+        if install_progress > 100.0:
+            install_progress = 100.0
+        candidates_raw = data.get("steam_exe_candidates", [])
+        candidates: List[str] = []
+        if isinstance(candidates_raw, list):
+            for item in candidates_raw:
+                text = str(item or "").strip()
+                if not text:
+                    continue
+                candidates.append(text)
+        share_ctx_raw = data.get("share_ctx")
+        share_ctx: Dict[str, Any] = {}
+        if isinstance(share_ctx_raw, dict):
+            try:
+                share_ctx = dict(share_ctx_raw)
+            except Exception:
+                share_ctx = {}
         return cls(
             task_id=str(data.get("task_id", "")),
             gid=str(data.get("gid", "")),
             game_id=str(data.get("game_id", "")),
             game_title=str(data.get("game_title", "")),
+            provider=str(data.get("provider", "tianyi") or "tianyi"),
+            share_url=str(data.get("share_url", "") or "").strip(),
+            share_ctx=share_ctx,
+            notice=str(data.get("notice", "") or "").strip(),
             share_code=str(data.get("share_code", "")),
             share_id=str(data.get("share_id", "")),
             file_id=str(data.get("file_id", "")),
             file_name=str(data.get("file_name", "")),
+            file_size=_to_int(data.get("file_size", 0), 0),
             download_dir=str(data.get("download_dir", "")),
             local_path=str(data.get("local_path", "")),
             status=str(data.get("status", "waiting")),
@@ -105,8 +165,12 @@ class TianyiTaskRecord:
             speed=_to_int(data.get("speed", 0), 0),
             openpath=str(data.get("openpath", "") or ""),
             install_status=str(data.get("install_status", "pending") or "pending"),
+            install_progress=install_progress,
             install_message=str(data.get("install_message", "") or ""),
             installed_path=str(data.get("installed_path", "") or ""),
+            steam_import_status=str(data.get("steam_import_status", "pending") or "pending"),
+            steam_exe_candidates=candidates,
+            steam_exe_selected=str(data.get("steam_exe_selected", "") or ""),
             post_processed=_to_bool(data.get("post_processed", False), False),
             error_reason=str(data.get("error_reason", "") or ""),
             created_at=_to_int(data.get("created_at", _now_ts()), _now_ts()),
@@ -122,6 +186,12 @@ class TianyiInstalledGame:
     game_title: str
     install_path: str
     source_path: str
+    platform: str = ""
+    emulator_id: str = ""
+    switch_title_id: str = ""
+    rom_path: str = ""
+    emulator_path: str = ""
+    eden_data_root_hint: str = ""
     status: str = "installed"
     size_bytes: int = 0
     steam_app_id: int = 0
@@ -141,6 +211,12 @@ class TianyiInstalledGame:
             game_title=str(data.get("game_title", "")),
             install_path=str(data.get("install_path", "")),
             source_path=str(data.get("source_path", "")),
+            platform=str(data.get("platform", "") or "").strip(),
+            emulator_id=str(data.get("emulator_id", "") or "").strip(),
+            switch_title_id=str(data.get("switch_title_id", "") or "").strip(),
+            rom_path=str(data.get("rom_path", "") or "").strip(),
+            emulator_path=str(data.get("emulator_path", "") or "").strip(),
+            eden_data_root_hint=str(data.get("eden_data_root_hint", "") or "").strip(),
             status=str(data.get("status", "installed") or "installed"),
             size_bytes=max(0, _to_int(data.get("size_bytes", 0), 0)),
             steam_app_id=max(0, _to_int(data.get("steam_app_id", 0), 0)),
@@ -160,32 +236,46 @@ class TianyiStateStore:
     def __init__(self, state_file: str):
         self._state_file = state_file
         self._lock = threading.RLock()
+        self._settings_migration_needed = False
         self.login = TianyiLoginState()
+        self.baidu_login = BaiduLoginState()
+        self.ctfile_login = CtfileLoginState()
         self.settings = TianyiSettings()
         self.tasks: List[TianyiTaskRecord] = []
         self.installed_games: List[TianyiInstalledGame] = []
         self.cloud_save_last_result: Dict[str, Any] = {}
         self.cloud_save_restore_last_result: Dict[str, Any] = {}
+        self.runtime_repair_last_result: Dict[str, Any] = {}
 
     @property
     def state_file(self) -> str:
         """返回状态文件路径。"""
         return self._state_file
 
+    @property
+    def settings_migration_needed(self) -> bool:
+        """返回设置是否需要补写新增字段。"""
+        with self._lock:
+            return bool(self._settings_migration_needed)
+
     def load(self) -> None:
         """从磁盘加载状态。"""
         with self._lock:
+            self._settings_migration_needed = False
             if not os.path.exists(self._state_file):
                 return
             with open(self._state_file, "r", encoding="utf-8") as f:
                 raw = json.load(f)
 
             login_raw = raw.get("login") if isinstance(raw, dict) else {}
+            baidu_login_raw = raw.get("baidu_login") if isinstance(raw, dict) else {}
+            ctfile_login_raw = raw.get("ctfile_login") if isinstance(raw, dict) else {}
             settings_raw = raw.get("settings") if isinstance(raw, dict) else {}
             tasks_raw = raw.get("tasks") if isinstance(raw, dict) else []
             installed_raw = raw.get("installed_games") if isinstance(raw, dict) else []
             cloud_save_raw = raw.get("cloud_save_last_result") if isinstance(raw, dict) else {}
             cloud_restore_raw = raw.get("cloud_save_restore_last_result") if isinstance(raw, dict) else {}
+            runtime_repair_raw = raw.get("runtime_repair_last_result") if isinstance(raw, dict) else {}
 
             if isinstance(login_raw, dict):
                 self.login = TianyiLoginState(
@@ -194,14 +284,38 @@ class TianyiStateStore:
                     updated_at=_to_int(login_raw.get("updated_at", 0), 0),
                 )
 
+            if isinstance(baidu_login_raw, dict):
+                self.baidu_login = BaiduLoginState(
+                    cookie=str(baidu_login_raw.get("cookie", "")),
+                    user_account=str(baidu_login_raw.get("user_account", "")),
+                    updated_at=_to_int(baidu_login_raw.get("updated_at", 0), 0),
+                )
+
+            if isinstance(ctfile_login_raw, dict):
+                self.ctfile_login = CtfileLoginState(
+                    token=str(ctfile_login_raw.get("token", "") or "").strip(),
+                    updated_at=_to_int(ctfile_login_raw.get("updated_at", 0), 0),
+                )
+
             if isinstance(settings_raw, dict):
+                if "cloud_save_auto_upload" not in settings_raw:
+                    self._settings_migration_needed = True
                 self.settings = TianyiSettings(
                     download_dir=str(settings_raw.get("download_dir", "")),
                     install_dir=str(settings_raw.get("install_dir", "")),
+                    emulator_dir=str(settings_raw.get("emulator_dir", "")),
                     split_count=max(1, min(64, _to_int(settings_raw.get("split_count", 16), 16))),
+                    aria2_fast_mode=_to_bool(settings_raw.get("aria2_fast_mode", False), False),
+                    force_ipv4=_to_bool(settings_raw.get("force_ipv4", True), True),
+                    auto_switch_line=_to_bool(settings_raw.get("auto_switch_line", True), True),
                     page_size=max(10, min(200, _to_int(settings_raw.get("page_size", 50), 50))),
                     auto_delete_package=_to_bool(settings_raw.get("auto_delete_package", False), False),
                     auto_install=_to_bool(settings_raw.get("auto_install", True), True),
+                    lsfg_enabled=_to_bool(settings_raw.get("lsfg_enabled", False), False),
+                    show_playtime_widget=_to_bool(settings_raw.get("show_playtime_widget", True), True),
+                    cloud_save_auto_upload=_to_bool(settings_raw.get("cloud_save_auto_upload", False), False),
+                    steamgriddb_enabled=_to_bool(settings_raw.get("steamgriddb_enabled", False), False),
+                    steamgriddb_api_key=str(settings_raw.get("steamgriddb_api_key", "") or "").strip(),
                 )
 
             next_tasks: List[TianyiTaskRecord] = []
@@ -242,17 +356,25 @@ class TianyiStateStore:
             else:
                 self.cloud_save_restore_last_result = {}
 
+            if isinstance(runtime_repair_raw, dict):
+                self.runtime_repair_last_result = dict(runtime_repair_raw)
+            else:
+                self.runtime_repair_last_result = {}
+
     def save(self) -> None:
         """将状态写入磁盘。"""
         with self._lock:
             os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
             payload = {
                 "login": asdict(self.login),
+                "baidu_login": asdict(self.baidu_login),
+                "ctfile_login": asdict(self.ctfile_login),
                 "settings": asdict(self.settings),
                 "tasks": [asdict(t) for t in self.tasks],
                 "installed_games": [asdict(g) for g in self.installed_games],
                 "cloud_save_last_result": dict(self.cloud_save_last_result or {}),
                 "cloud_save_restore_last_result": dict(self.cloud_save_restore_last_result or {}),
+                "runtime_repair_last_result": dict(self.runtime_repair_last_result or {}),
             }
             tmp_path = f"{self._state_file}.tmp"
             replace_error: Optional[BaseException] = None
@@ -306,14 +428,54 @@ class TianyiStateStore:
             self.login = TianyiLoginState()
             self.save()
 
+    def set_ctfile_token(self, token: str) -> None:
+        """保存 CTFile token（session_id）。"""
+        with self._lock:
+            self.ctfile_login = CtfileLoginState(
+                token=str(token or "").strip(),
+                updated_at=_now_ts(),
+            )
+            self.save()
+
+    def clear_ctfile_token(self) -> None:
+        """清除 CTFile token。"""
+        with self._lock:
+            self.ctfile_login = CtfileLoginState()
+            self.save()
+
+    def set_baidu_login(self, cookie: str, user_account: str = "") -> None:
+        """更新百度网盘登录态。"""
+        with self._lock:
+            self.baidu_login = BaiduLoginState(
+                cookie=cookie.strip(),
+                user_account=(user_account or "").strip(),
+                updated_at=_now_ts(),
+            )
+            self.save()
+
+    def clear_baidu_login(self) -> None:
+        """清除百度网盘登录态。"""
+        with self._lock:
+            self.baidu_login = BaiduLoginState()
+            self.save()
+
     def set_settings(
         self,
         download_dir: Optional[str] = None,
         install_dir: Optional[str] = None,
+        emulator_dir: Optional[str] = None,
         split_count: Optional[int] = None,
+        aria2_fast_mode: Optional[bool] = None,
+        force_ipv4: Optional[bool] = None,
+        auto_switch_line: Optional[bool] = None,
         page_size: Optional[int] = None,
         auto_delete_package: Optional[bool] = None,
         auto_install: Optional[bool] = None,
+        lsfg_enabled: Optional[bool] = None,
+        show_playtime_widget: Optional[bool] = None,
+        cloud_save_auto_upload: Optional[bool] = None,
+        steamgriddb_enabled: Optional[bool] = None,
+        steamgriddb_api_key: Optional[str] = None,
     ) -> None:
         """更新设置。"""
         with self._lock:
@@ -321,14 +483,32 @@ class TianyiStateStore:
                 self.settings.download_dir = str(download_dir).strip()
             if install_dir is not None:
                 self.settings.install_dir = str(install_dir).strip()
+            if emulator_dir is not None:
+                self.settings.emulator_dir = str(emulator_dir).strip()
             if split_count is not None:
                 self.settings.split_count = max(1, min(64, int(split_count)))
+            if aria2_fast_mode is not None:
+                self.settings.aria2_fast_mode = bool(aria2_fast_mode)
+            if force_ipv4 is not None:
+                self.settings.force_ipv4 = bool(force_ipv4)
+            if auto_switch_line is not None:
+                self.settings.auto_switch_line = bool(auto_switch_line)
             if page_size is not None:
                 self.settings.page_size = max(10, min(200, int(page_size)))
             if auto_delete_package is not None:
                 self.settings.auto_delete_package = bool(auto_delete_package)
             if auto_install is not None:
                 self.settings.auto_install = bool(auto_install)
+            if lsfg_enabled is not None:
+                self.settings.lsfg_enabled = bool(lsfg_enabled)
+            if show_playtime_widget is not None:
+                self.settings.show_playtime_widget = bool(show_playtime_widget)
+            if cloud_save_auto_upload is not None:
+                self.settings.cloud_save_auto_upload = bool(cloud_save_auto_upload)
+            if steamgriddb_enabled is not None:
+                self.settings.steamgriddb_enabled = bool(steamgriddb_enabled)
+            if steamgriddb_api_key is not None:
+                self.settings.steamgriddb_api_key = str(steamgriddb_api_key or "").strip()
             self.save()
 
     def upsert_tasks(self, records: List[TianyiTaskRecord]) -> None:
@@ -359,6 +539,12 @@ class TianyiStateStore:
                     game_title=str(record.game_title or current.game_title),
                     install_path=target_path or current.install_path,
                     source_path=str(record.source_path or current.source_path),
+                    platform=str(record.platform or current.platform or "").strip(),
+                    emulator_id=str(record.emulator_id or current.emulator_id or "").strip(),
+                    switch_title_id=str(record.switch_title_id or current.switch_title_id or "").strip(),
+                    rom_path=str(record.rom_path or current.rom_path or "").strip(),
+                    emulator_path=str(record.emulator_path or current.emulator_path or "").strip(),
+                    eden_data_root_hint=str(record.eden_data_root_hint or current.eden_data_root_hint or "").strip(),
                     status=str(record.status or current.status),
                     size_bytes=max(0, int(record.size_bytes or current.size_bytes or 0)),
                     steam_app_id=max(0, int(record.steam_app_id or current.steam_app_id or 0)),
@@ -388,6 +574,12 @@ class TianyiStateStore:
                 game_title=str(record.game_title or "未命名游戏"),
                 install_path=target_path,
                 source_path=str(record.source_path or ""),
+                platform=str(record.platform or "").strip(),
+                emulator_id=str(record.emulator_id or "").strip(),
+                switch_title_id=str(record.switch_title_id or "").strip(),
+                rom_path=str(record.rom_path or "").strip(),
+                emulator_path=str(record.emulator_path or "").strip(),
+                eden_data_root_hint=str(record.eden_data_root_hint or "").strip(),
                 status=str(record.status or "installed"),
                 size_bytes=max(0, int(record.size_bytes or 0)),
                 steam_app_id=max(0, int(record.steam_app_id or 0)),
@@ -435,5 +627,11 @@ class TianyiStateStore:
         """更新最近一次云存档恢复结果。"""
         with self._lock:
             self.cloud_save_restore_last_result = dict(result or {})
+            self.save()
+
+    def set_runtime_repair_last_result(self, result: Optional[Dict[str, Any]]) -> None:
+        """更新最近一次运行库修复结果。"""
+        with self._lock:
+            self.runtime_repair_last_result = dict(result or {})
             self.save()
 

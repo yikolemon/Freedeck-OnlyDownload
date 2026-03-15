@@ -22,6 +22,13 @@ import aiohttp
 import config
 
 
+ARIA2_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64; Valve Steam Gamepad/Steam Deck Stable) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.6478.183 Safari/537.36"
+)
+
+
 @dataclass
 class Aria2Runtime:
     """运行中的 aria2 信息。"""
@@ -111,6 +118,19 @@ class Aria2Manager:
         session_file = os.path.join(self._work_dir, "aria2.session")
         input_file = session_file if os.path.exists(session_file) else "/dev/null"
 
+        ca_cert = ""
+        for candidate in (
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/cert.pem",
+        ):
+            try:
+                if os.path.isfile(candidate):
+                    ca_cert = candidate
+                    break
+            except Exception:
+                continue
+
         args = [
             binary_path,
             "--enable-rpc=true",
@@ -124,6 +144,14 @@ class Aria2Manager:
             self._work_dir,
             "--continue=true",
             "--max-concurrent-downloads=3",
+            "--file-allocation=none",
+            "--check-certificate=true",
+            "--connect-timeout=10",
+            "--timeout=60",
+            "--retry-wait=5",
+            "--max-tries=10",
+            "--max-file-not-found=5",
+            "--max-connection-per-server=32",
             "--input-file",
             input_file,
             "--save-session",
@@ -134,6 +162,8 @@ class Aria2Manager:
             "--daemon=false",
             "--summary-interval=0",
         ]
+        if ca_cert:
+            args.extend(["--ca-certificate", ca_cert])
 
         proc = subprocess.Popen(
             args,
@@ -232,20 +262,55 @@ class Aria2Manager:
         download_dir: str,
         out_name: str,
         split: int,
+        max_connection_per_server: int = 16,
+        min_split_size: str = "1M",
+        disk_cache: str = "",
+        disable_ipv6: bool = False,
+        referer: str = "",
+        user_agent: str = "",
     ) -> str:
         """创建下载任务并返回 gid。"""
         split = max(1, min(64, int(split)))
+        max_conn = max(1, min(64, int(max_connection_per_server or 1)))
+        min_split_size = str(min_split_size or "1M").strip() or "1M"
+        disk_cache = str(disk_cache or "").strip()
         await self.ensure_running()
+        # 某些 aria2 版本对 per-task 选项的覆盖行为不一致，这里尽量同步全局上限。
+        try:
+            global_options = {
+                "max-connection-per-server": str(max_conn),
+                "disable-ipv6": "true" if bool(disable_ipv6) else "false",
+            }
+            if disk_cache:
+                global_options["disk-cache"] = disk_cache
+            await self._rpc_call(
+                "aria2.changeGlobalOption",
+                [
+                    global_options,
+                ],
+            )
+        except Exception:
+            pass
+        ref = str(referer or "").strip() or "https://cloud.189.cn/"
+        ua = str(user_agent or "").strip() or ARIA2_DEFAULT_USER_AGENT
+        headers: List[str] = [f"User-Agent: {ua}", f"Referer: {ref}"]
+        cookie_text = (cookie or "").strip()
+        if cookie_text:
+            headers.insert(0, f"Cookie: {cookie_text}")
         options = {
             "dir": download_dir,
             "out": out_name,
-            "header": [f"Cookie: {cookie}"],
+            "header": headers,
             "split": str(split),
-            "max-connection-per-server": str(split),
-            "min-split-size": "1M",
+            "max-connection-per-server": str(min(split, max_conn)),
+            "min-split-size": min_split_size,
             "continue": "true",
             "allow-overwrite": "true",
             "auto-file-renaming": "false",
+            "connect-timeout": "10",
+            "timeout": "60",
+            "retry-wait": "5",
+            "max-tries": "10",
         }
         result = await self._rpc_call("aria2.addUri", [[direct_url], options])
         gid = str(result or "").strip()
@@ -253,9 +318,49 @@ class Aria2Manager:
             raise Aria2Error("aria2.addUri 返回空 gid")
         return gid
 
+    async def change_global_options(self, options: Dict[str, str]) -> None:
+        """变更 aria2 全局选项（用于网络环境调整等）。"""
+        safe_options: Dict[str, str] = {}
+        for key, value in (options or {}).items():
+            k = str(key or "").strip()
+            if not k:
+                continue
+            safe_options[k] = str(value if value is not None else "").strip()
+        if not safe_options:
+            return
+        await self.ensure_running()
+        await self._rpc_call("aria2.changeGlobalOption", [safe_options])
+
+    async def get_uris(self, gid: str) -> List[str]:
+        """获取任务 URI 列表。"""
+        result = await self._rpc_call("aria2.getUris", [gid])
+        if not isinstance(result, list):
+            raise Aria2Error("aria2.getUris 返回格式异常")
+        uris: List[str] = []
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            uri = str(item.get("uri", "") or "").strip()
+            if uri:
+                uris.append(uri)
+        return uris
+
+    async def replace_uri(self, gid: str, direct_url: str) -> None:
+        """替换任务直链（用于切线路/重取直链）。"""
+        url = str(direct_url or "").strip()
+        if not url:
+            raise Aria2Error("replace_uri 直链为空")
+        uris = []
+        try:
+            uris = await self.get_uris(gid)
+        except Exception:
+            uris = []
+        # fileIndex 从 1 开始；单文件下载通常为 1。
+        await self._rpc_call("aria2.changeUri", [gid, 1, uris, [url], 0])
+
     async def tell_status(self, gid: str) -> Dict[str, Any]:
         """查询任务状态。"""
-        keys = ["status", "totalLength", "completedLength", "downloadSpeed", "errorMessage"]
+        keys = ["status", "totalLength", "completedLength", "downloadSpeed", "errorMessage", "errorCode"]
         result = await self._rpc_call("aria2.tellStatus", [gid, keys])
         if not isinstance(result, dict):
             raise Aria2Error("aria2.tellStatus 返回格式异常")

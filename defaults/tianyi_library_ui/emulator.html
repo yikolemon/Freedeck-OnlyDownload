@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark" />
+  <title>Freedeck 模拟器</title>
+  <link rel="stylesheet" href="/tianyi/library/app.css?v=20260312_1" />
+</head>
+<body>
+  <main id="app" v-cloak class="page">
+    <section class="hero library-hero">
+      <div class="library-header">
+        <h1 class="library-title">Switch 模拟器资源</h1>
+        <p class="library-status">{{ catalogStatusText }}</p>
+        <p class="library-status library-status-bad" v-if="catalog.error">{{ catalog.error }}</p>
+      </div>
+
+      <form class="library-toolbar" @submit.prevent="reloadList(1)">
+        <div class="library-toolbar-row">
+          <input
+            id="search-input"
+            v-model="query"
+            :class="{ 'focus-ring': focusedIndex === 0 }"
+            type="text"
+            placeholder="搜索 Switch 游戏（留空浏览全部）"
+            autocomplete="off"
+            aria-label="搜索 Switch 游戏名称"
+            @input="onQueryInput"
+            @focus="onTextInputFocus('search')"
+            @click="onTextInputClick('search')"
+          />
+        </div>
+
+        <div class="library-toolbar-actions">
+          <button
+            id="emulator-button"
+            class="btn-secondary"
+            :class="{ 'focus-ring': focusedIndex === 1 }"
+            type="button"
+            @click="openEmulatorPage"
+          >
+            返回游戏库
+          </button>
+        </div>
+      </form>
+
+      <p class="hint" v-if="!isSwitchEmulatorPage">{{ hintText }}</p>
+    </section>
+
+    <section class="results" v-if="shouldShowResults">
+      <template v-if="list.items.length > 0">
+        <div class="card-grid">
+          <article
+            :class="['game-card', { 'focus-ring': !isCatalogMenuOpen() && focusedIndex === idx + cardFocusStart }]"
+            v-for="(item, idx) in list.items"
+            :key="item.group_key || item.game_id + item.down_url"
+            :data-card-index="idx"
+            tabindex="0"
+            @click="onEmulatorItemClick(item)"
+          >
+            <div class="card-media">
+              <img
+                :src="coverFor(item)"
+                :alt="item.title"
+                loading="lazy"
+                @error="onCoverError($event, item)"
+              />
+              <div class="card-overlay">
+                <h3 class="card-title">{{ item.title }}</h3>
+                <div class="card-meta">
+                  <span>{{ item.categories || "未分类" }}</span>
+                  <span>{{ cardSizeLabel(item) }}</span>
+                </div>
+              </div>
+              <div class="card-badge" v-if="item.variant_count && item.variant_count > 1">
+                {{ `${item.variant_count} 个版本` }}
+              </div>
+            </div>
+          </article>
+        </div>
+
+        <div class="load-more-row" v-if="canLoadMore">
+          <button
+            id="load-more-button"
+            class="btn-secondary"
+            :class="{ 'focus-ring': focusedIndex === loadMoreFocusIndex }"
+            type="button"
+            @click="loadMoreBrowse"
+          >
+            加载更多
+          </button>
+        </div>
+      </template>
+
+      <p class="empty" v-else-if="catalog.loading">正在加载 Switch 资源列表...</p>
+      <p class="empty" v-else>没有匹配结果</p>
+    </section>
+
+    <p class="toast" v-if="message">{{ message }}</p>
+
+    <section class="modal-mask" v-if="installDialog.visible">
+      <div class="modal-card">
+        <div class="modal-loading" v-if="installDialog.loading && !installDialog.plan">正在读取安装信息...</div>
+
+        <template v-else-if="installDialog.plan">
+          <div class="install-layout">
+            <div class="modal-cover-panel">
+              <div class="cover-art-anchor">
+                <div class="modal-cover-stage">
+                  <img
+                    class="modal-cover"
+                    :src="coverFor(installDialog.game || installDialog.plan)"
+                    :alt="installDialog.plan.game_title || '游戏封面'"
+                    @error="onCoverError($event, installDialog.game || installDialog.plan)"
+                  />
+                  <p class="cover-stage-tagline">READY FOR INSTALL</p>
+                </div>
+                <div class="cover-size-pill">{{ formatBytesCompact(totalRequiredBytes(installDialog.plan)) }}</div>
+                <div :class="['cover-check-pill', protonBadgeClass(protonTierFor(installDialog.game || installDialog.plan))]">
+                  {{ protonBadgeMark(protonTierFor(installDialog.game || installDialog.plan)) }}
+                </div>
+              </div>
+              <div class="cover-title-stack">
+                <h3 class="modal-title">{{ modalChineseTitle(installDialog.plan.game_title || (installDialog.game && installDialog.game.title) || "") }}</h3>
+                <p class="modal-game-en">{{ modalEnglishTitle(installDialog.plan.game_title || (installDialog.game && installDialog.game.title) || "") }}</p>
+              </div>
+            </div>
+
+            <div class="modal-side">
+              <p class="modal-sub">确认后自动下载并解压安装</p>
+
+              <div class="md3-select-block" v-if="installDialog.variants && installDialog.variants.length > 1">
+                <div class="md3-select-anchor">
+                  <button
+                    id="install-version-select"
+                    type="button"
+                    :class="['md3-select-field', { open: installDialog.versionMenuOpen, 'focus-ring': focusedIndex === 2 }]"
+                    @click="toggleInstallVersionMenu"
+                  >
+                    <span class="md3-select-text">
+                      <span class="md3-select-label">版本</span>
+                      <span class="md3-select-value">{{ selectedInstallVersionLabel }}</span>
+                    </span>
+                    <span class="md3-select-icon" aria-hidden="true">▾</span>
+                  </button>
+
+                  <div class="md3-menu" v-if="installDialog.versionMenuOpen">
+                    <button
+                      v-for="(ver, vidx) in installDialog.variants"
+                      :key="String(ver.game_id || vidx) + String(ver.down_url || '')"
+                      :data-version-index="vidx"
+                      tabindex="0"
+                      type="button"
+                      :class="[
+                        'md3-menu-item',
+                        { selected: installDialog.selectedVariantIndex === vidx, 'focus-ring': focusedIndex === vidx + 3 },
+                      ]"
+                      @click="chooseInstallVersion(vidx)"
+                    >
+                      <span class="md3-menu-item-text">{{ installVersionLabel(ver, vidx) }}</span>
+                      <span class="md3-menu-item-check" aria-hidden="true">{{ installDialog.selectedVariantIndex === vidx ? "✓" : "" }}</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="space-block">
+                <div class="space-row">
+                  <span>总需空间</span>
+                  <strong>{{ totalRequiredFormula(installDialog.plan) }}</strong>
+                </div>
+                <div class="space-row">
+                  <span>当前可用</span>
+                  <strong>{{ freeSpaceLabel(installDialog.plan) }}</strong>
+                </div>
+                <div class="space-row">
+                  <span>ProtonDB</span>
+                  <strong>{{ protonTierLabel(protonTierFor(installDialog.game || installDialog.plan)) }}</strong>
+                </div>
+              </div>
+
+              <div class="modal-actions">
+                <button
+                  id="install-confirm"
+                  class="btn-primary"
+                  :class="{ 'focus-ring': focusedIndex === 1 }"
+                  :disabled="!modalCanConfirm"
+                  @click="confirmInstall"
+                >
+                  {{ installDialog.submitting ? "提交中..." : "确认安装" }}
+                </button>
+                <button
+                  id="install-cancel"
+                  class="btn-secondary"
+                  :class="{ 'focus-ring': focusedIndex === 0 }"
+                  @click="closeInstallDialog"
+                >
+                  取消安装
+                </button>
+              </div>
+            </div>
+          </div>
+        </template>
+
+        <div class="modal-loading" v-else>无法获取安装信息，请稍后重试。</div>
+      </div>
+    </section>
+
+    <section class="modal-mask" v-if="emulatorNotice.visible && !installDialog.visible">
+      <div class="modal-card">
+        <h3 class="modal-title">{{ emulatorNotice.title || "提示" }}</h3>
+        <p class="modal-sub" style="white-space: pre-line">{{ emulatorNotice.message }}</p>
+        <div class="modal-actions">
+          <button class="btn-primary" @click="closeEmulatorNotice()">知道了</button>
+          <button class="btn-secondary" @click="closeEmulatorNotice({ dismiss: true })">不再提示</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/tianyi/library/vue.global.prod.js?v=20260312_1"></script>
+  <script src="/tianyi/library/app.js?v=20260312_1"></script>
+</body>
+</html>

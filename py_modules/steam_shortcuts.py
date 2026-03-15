@@ -7,6 +7,7 @@ import binascii
 import os
 import re
 import struct
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -28,11 +29,36 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _strip_outer_quotes(value: str) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = text[1:-1].strip()
+    return text
+
+
 def _find_steam_root() -> str:
-    candidates = [
-        os.path.expanduser("~/.steam/steam"),
-        os.path.expanduser("~/.local/share/Steam"),
+    homes = []
+    home_candidates = [
+        str(os.environ.get("DECKY_USER_HOME", "") or "").strip(),
+        str(os.environ.get("HOME", "") or "").strip(),
+        str(Path.home()),
+        "/home/deck",
     ]
+    for value in home_candidates:
+        if not value:
+            continue
+        try:
+            resolved = os.path.realpath(os.path.expanduser(value))
+        except Exception:
+            continue
+        if resolved and resolved not in homes:
+            homes.append(resolved)
+
+    candidates = []
+    for home in homes:
+        candidates.append(os.path.join(home, ".steam", "steam"))
+        candidates.append(os.path.join(home, ".local", "share", "Steam"))
+
     for item in candidates:
         steamapps = os.path.join(item, "steamapps")
         if os.path.isdir(steamapps):
@@ -202,13 +228,17 @@ def _upsert_shortcut_sync(
         shortcuts = {}
         payload["shortcuts"] = shortcuts
 
-    launch_key = str(launch_options or "").strip() or f"freedeck:tianyi:{game_id}"
+    launch_key = str(launch_options or "").strip()
+    expected_token = _extract_tianyi_launch_token(launch_key)
+    if not expected_token:
+        expected_token = _derive_tianyi_launch_token(game_id)
     target_idx: Optional[str] = None
     target_entry: Optional[Dict[str, Any]] = None
     for idx, item in shortcuts.items():
         if not isinstance(item, dict):
             continue
-        if str(item.get("LaunchOptions", "")).strip() == launch_key:
+        current_token = _extract_tianyi_token_from_shortcut(item)
+        if expected_token and current_token == expected_token:
             target_idx = str(idx)
             target_entry = item
             break
@@ -234,6 +264,12 @@ def _upsert_shortcut_sync(
 
     quoted_exe = f'"{exe_real}"'
     quoted_start = f'"{os.path.dirname(exe_real)}"'
+    expected_devkit = _tianyi_devkit_game_id(expected_token)
+
+    existing_launch_options = str(target_entry.get("LaunchOptions", "") or "").strip()
+    existing_launch_options = _strip_tianyi_launch_token(existing_launch_options)
+    incoming_launch_options = _strip_tianyi_launch_token(launch_key)
+    effective_launch_options = incoming_launch_options if incoming_launch_options else existing_launch_options
 
     target_entry.update(
         {
@@ -243,12 +279,12 @@ def _upsert_shortcut_sync(
             "StartDir": quoted_start,
             "icon": str(target_entry.get("icon", "") or ""),
             "ShortcutPath": str(target_entry.get("ShortcutPath", "") or ""),
-            "LaunchOptions": launch_key,
+            "LaunchOptions": effective_launch_options,
             "IsHidden": 0,
             "AllowDesktopConfig": 1,
             "OpenVR": 0,
             "Devkit": 0,
-            "DevkitGameID": "",
+            "DevkitGameID": expected_devkit,
             "DevkitOverrideAppID": "0",
             "LastPlayTime": 0,
             "FlatpakAppID": "",
@@ -281,7 +317,9 @@ def _set_proton_mapping_sync(*, steam_root: str, app_id: int, compat_tool: str) 
 
     app_id_unsigned = int(app_id) & 0xFFFFFFFF
     app_id_str = str(app_id_unsigned)
-    tool_name = str(compat_tool or "").strip() or "proton_experimental"
+    tool_name = str(compat_tool or "").strip()
+    if not tool_name:
+        return {"ok": False, "message": "compat_tool 为空"}
 
     try:
         with open(config_path, "r", encoding="utf-8", errors="ignore") as fp:
@@ -324,6 +362,33 @@ def _set_proton_mapping_sync(*, steam_root: str, app_id: int, compat_tool: str) 
     return {"ok": True, "message": f"已设置 Proton: {tool_name}"}
 
 
+def _get_proton_mapping_sync(*, steam_root: str, app_id: int) -> Dict[str, Any]:
+    config_path = _config_vdf_path(steam_root)
+    if not os.path.isfile(config_path):
+        return {"ok": False, "message": f"config.vdf 不存在: {config_path}", "compat_tool": ""}
+
+    app_id_unsigned = int(app_id) & 0xFFFFFFFF
+    app_id_str = str(app_id_unsigned)
+
+    try:
+        with open(config_path, "r", encoding="utf-8", errors="ignore") as fp:
+            content = fp.read()
+    except Exception as exc:
+        return {"ok": False, "message": f"读取 config.vdf 失败: {exc}", "compat_tool": ""}
+
+    pattern = re.compile(
+        rf'"{re.escape(app_id_str)}"\s*\{{.*?"name"\s*"\s*([^"\r\n]+)"',
+        re.DOTALL,
+    )
+    matched = pattern.search(content)
+    compat_tool = str(matched.group(1) or "").strip() if matched else ""
+    return {
+        "ok": True,
+        "message": "已读取 CompatToolMapping" if compat_tool else "CompatToolMapping 不存在",
+        "compat_tool": compat_tool,
+    }
+
+
 def _remove_proton_mapping_sync(*, steam_root: str, app_id: int) -> Dict[str, Any]:
     """Remove compat tool mapping for shortcut app id."""
     config_path = _config_vdf_path(steam_root)
@@ -361,13 +426,17 @@ def _remove_grid_assets_sync(*, steam_root: str, user_id: str, app_id: int) -> D
     """Remove Steam grid assets for shortcut app id."""
     app_id_unsigned = int(app_id) & 0xFFFFFFFF
     grid_dir = _grid_dir(steam_root, user_id)
-    targets = [
-        os.path.join(grid_dir, f"{app_id_unsigned}.jpg"),
-        os.path.join(grid_dir, f"{app_id_unsigned}p.jpg"),
-        os.path.join(grid_dir, f"{app_id_unsigned}_hero.jpg"),
-        os.path.join(grid_dir, f"{app_id_unsigned}_logo.png"),
-        os.path.join(grid_dir, f"{app_id_unsigned}_icon.jpg"),
+    bases = [
+        (os.path.join(grid_dir, f"{app_id_unsigned}"), [".jpg", ".png"]),
+        (os.path.join(grid_dir, f"{app_id_unsigned}p"), [".jpg", ".png"]),
+        (os.path.join(grid_dir, f"{app_id_unsigned}_hero"), [".jpg", ".png"]),
+        (os.path.join(grid_dir, f"{app_id_unsigned}_logo"), [".png", ".jpg"]),
+        (os.path.join(grid_dir, f"{app_id_unsigned}_icon"), [".jpg", ".png"]),
     ]
+    targets: List[str] = []
+    for base, exts in bases:
+        for ext in exts:
+            targets.append(f"{base}{ext}")
     removed: List[str] = []
     failed: List[str] = []
     for path in targets:
@@ -384,6 +453,33 @@ def _remove_grid_assets_sync(*, steam_root: str, user_id: str, app_id: int) -> D
         "removed": removed,
         "failed": failed,
     }
+
+
+def _remove_compatdata_prefix_sync(*, steam_root: str, app_id: int) -> Dict[str, Any]:
+    """Remove Steam compatdata prefix for shortcut app id."""
+    compat_root = os.path.realpath(os.path.join(str(steam_root or "").strip(), "steamapps", "compatdata"))
+    if not compat_root or not os.path.isdir(compat_root):
+        return {"ok": False, "removed": False, "message": f"compatdata 目录不存在: {compat_root}"}
+
+    app_id_unsigned = int(app_id) & 0xFFFFFFFF
+    if app_id_unsigned <= 0:
+        return {"ok": False, "removed": False, "message": "appid 无效"}
+
+    target = os.path.realpath(os.path.join(compat_root, str(app_id_unsigned)))
+    if target != compat_root and not target.startswith(compat_root + os.sep):
+        return {"ok": False, "removed": False, "message": "compatdata 路径不安全"}
+    if not os.path.lexists(target):
+        return {"ok": True, "removed": False, "path": target, "message": "Proton 前缀不存在"}
+
+    try:
+        if os.path.islink(target) or os.path.isfile(target):
+            os.remove(target)
+        else:
+            shutil.rmtree(target, ignore_errors=False)
+    except Exception as exc:
+        return {"ok": False, "removed": False, "path": target, "message": f"删除 Proton 前缀失败: {exc}"}
+
+    return {"ok": True, "removed": True, "path": target, "message": "已删除 Proton 前缀"}
 
 
 def _reindex_shortcuts(shortcuts: Dict[str, Any]) -> Dict[str, Any]:
@@ -409,7 +505,8 @@ def _remove_tianyi_shortcut_sync(*, game_id: str) -> Dict[str, Any]:
     if vdf is None:
         return {"ok": False, "message": "vdf 模块不可用，无法写入 Steam shortcuts.vdf", "removed": False}
 
-    launch_options = f"freedeck:tianyi:{_derive_tianyi_launch_token(game_id)}"
+    expected_token = _derive_tianyi_launch_token(game_id)
+    expected_launch_options = _tianyi_devkit_game_id(expected_token) or f"freedeck:tianyi:{expected_token}"
 
     steam_root = _find_steam_root()
     if not steam_root:
@@ -431,7 +528,8 @@ def _remove_tianyi_shortcut_sync(*, game_id: str) -> Dict[str, Any]:
     for idx, item in shortcuts.items():
         if not isinstance(item, dict):
             continue
-        if str(item.get("LaunchOptions", "") or "").strip() == launch_options:
+        token = _extract_tianyi_token_from_shortcut(item)
+        if token == expected_token:
             remove_keys.append(str(idx))
             removed_items.append(dict(item))
 
@@ -443,7 +541,7 @@ def _remove_tianyi_shortcut_sync(*, game_id: str) -> Dict[str, Any]:
             "steam_root": steam_root,
             "user_id": user_id,
             "shortcut_path": shortcuts_file,
-            "launch_options": launch_options,
+            "launch_options": expected_launch_options,
         }
 
     for key in remove_keys:
@@ -468,44 +566,96 @@ def _remove_tianyi_shortcut_sync(*, game_id: str) -> Dict[str, Any]:
         "steam_root": steam_root,
         "user_id": user_id,
         "shortcut_path": shortcuts_file,
-        "launch_options": launch_options,
+        "launch_options": expected_launch_options,
         "appid": int(app_id),
         "appid_unsigned": int(app_id_unsigned),
         "removed_count": len(remove_keys),
     }
 
 
-async def _download_image_to(path: str, url: str) -> bool:
-    target = str(path or "").strip()
+def _infer_image_ext(url: str, content_type: str) -> str:
+    ctype = str(content_type or "").split(";", 1)[0].strip().lower()
+    if ctype == "image/png":
+        return ".png"
+    if ctype in {"image/jpeg", "image/jpg"}:
+        return ".jpg"
+
+    lowered = str(url or "").strip().lower()
+    if lowered.endswith(".png"):
+        return ".png"
+    if lowered.endswith(".jpg") or lowered.endswith(".jpeg"):
+        return ".jpg"
+    return ""
+
+
+async def _fetch_image_bytes(
+    session: aiohttp.ClientSession,
+    url: str,
+) -> tuple[int, bytes, str]:
     source = str(url or "").strip()
-    if not target or not source:
-        return False
-    timeout = aiohttp.ClientTimeout(total=12)
-    headers = {"User-Agent": "Mozilla/5.0 (Freedeck/1.0; +https://cloud.189.cn)"}
+    if not source:
+        return 0, b"", ""
     try:
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(source, ssl=False) as resp:
-                if int(resp.status) < 200 or int(resp.status) >= 300:
-                    return False
-                data = await resp.read()
-                if not data:
-                    return False
-        await asyncio.to_thread(_atomic_write_bytes, target, data)
-        return True
+        async with session.get(source, ssl=False) as resp:
+            status = int(resp.status)
+            content_type = str(resp.headers.get("Content-Type", "") or "")
+            if status < 200 or status >= 300:
+                return status, b"", content_type
+            data = await resp.read()
+            return status, data or b"", content_type
     except Exception:
-        return False
+        return 0, b"", ""
 
 
-async def _download_image_from_candidates(path: str, urls: List[str]) -> bool:
-    """Download first available URL from candidates."""
+def _remove_variants_sync(base_path: str, exts: List[str]) -> None:
+    base = str(base_path or "").strip()
+    if not base:
+        return
+    for ext in exts:
+        path = f"{base}{ext}"
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except Exception:
+            continue
+
+
+async def _download_image_to_base(
+    *,
+    session: aiohttp.ClientSession,
+    base_path: str,
+    urls: List[str],
+    allowed_exts: List[str],
+) -> str:
+    """Download first available URL and write to base_path + inferred ext.
+
+    Returns the written file path on success, empty string otherwise.
+    """
+    target_base = str(base_path or "").strip()
+    if not target_base:
+        return ""
+
     for item in urls:
         url = str(item or "").strip()
         if not url:
             continue
-        ok = await _download_image_to(path, url)
-        if ok:
-            return True
-    return False
+        status, data, content_type = await _fetch_image_bytes(session, url)
+        if status and (status < 200 or status >= 300):
+            continue
+        if not data:
+            continue
+        ext = _infer_image_ext(url, content_type)
+        if not ext or ext not in allowed_exts:
+            continue
+        target = f"{target_base}{ext}"
+        try:
+            await asyncio.to_thread(_atomic_write_bytes, target, data)
+            cleanup = [value for value in allowed_exts if value != ext]
+            await asyncio.to_thread(_remove_variants_sync, target_base, cleanup)
+            return target
+        except Exception:
+            continue
+    return ""
 
 
 def _copy_file_sync(source_path: str, target_path: str) -> bool:
@@ -538,47 +688,114 @@ async def _apply_grid_assets(
     await asyncio.to_thread(os.makedirs, grid_dir, mode=0o777, exist_ok=True)
 
     app_id_unsigned = int(app_id) & 0xFFFFFFFF
-    landscape_path = os.path.join(grid_dir, f"{app_id_unsigned}.jpg")
-    portrait_path = os.path.join(grid_dir, f"{app_id_unsigned}p.jpg")
-    hero_path = os.path.join(grid_dir, f"{app_id_unsigned}_hero.jpg")
-    logo_path = os.path.join(grid_dir, f"{app_id_unsigned}_logo.png")
-    icon_path = os.path.join(grid_dir, f"{app_id_unsigned}_icon.jpg")
+    bases = {
+        "landscape": os.path.join(grid_dir, f"{app_id_unsigned}"),
+        "portrait": os.path.join(grid_dir, f"{app_id_unsigned}p"),
+        "hero": os.path.join(grid_dir, f"{app_id_unsigned}_hero"),
+        "logo": os.path.join(grid_dir, f"{app_id_unsigned}_logo"),
+        "icon": os.path.join(grid_dir, f"{app_id_unsigned}_icon"),
+    }
 
-    targets = [
-        ("landscape", landscape_path, list(landscape_urls or [])),
-        ("portrait", portrait_path, list(portrait_urls or [])),
-        ("hero", hero_path, list(hero_urls or [])),
-        ("logo", logo_path, list(logo_urls or [])),
-        ("icon", icon_path, list(icon_urls or [])),
-    ]
+    allowed_exts = {
+        "landscape": [".jpg", ".png"],
+        "portrait": [".jpg", ".png"],
+        "hero": [".jpg", ".png"],
+        "logo": [".png", ".jpg"],
+        "icon": [".jpg", ".png"],
+    }
 
-    tasks = [asyncio.create_task(_download_image_from_candidates(path, urls)) for _, path, urls in targets if urls]
-    labels = [label for label, _, urls in targets if urls]
+    status: Dict[str, bool] = {"landscape": False, "portrait": False, "hero": False, "logo": False, "icon": False}
+    written: Dict[str, str] = {"landscape": "", "portrait": "", "hero": "", "logo": "", "icon": ""}
+    candidates = {
+        "landscape": list(landscape_urls or []),
+        "portrait": list(portrait_urls or []),
+        "hero": list(hero_urls or []),
+        "logo": list(logo_urls or []),
+        "icon": list(icon_urls or []),
+    }
 
-    status = {"landscape": False, "portrait": False, "hero": False, "logo": False, "icon": False}
-    if not tasks:
+    if not any(bool(urls) for urls in candidates.values()):
         return {"ok": True, "status": status, "message": "无可用封面 URL"}
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for idx, item in enumerate(results):
-        label = labels[idx]
-        status[label] = bool(item is True)
+    timeout = aiohttp.ClientTimeout(total=14)
+    headers = {"User-Agent": "Mozilla/5.0 (Freedeck/1.0; +https://cloud.189.cn)"}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        for key, urls in candidates.items():
+            if not urls:
+                continue
+            saved = await _download_image_to_base(
+                session=session,
+                base_path=bases[key],
+                urls=urls,
+                allowed_exts=allowed_exts[key],
+            )
+            if saved:
+                status[key] = True
+                written[key] = saved
+
+    # Fallback: no landscape -> reuse portrait.
+    if not status.get("landscape") and status.get("portrait"):
+        source = written.get("portrait")
+        if source:
+            ext = os.path.splitext(source)[1] or ".jpg"
+            if ext not in allowed_exts["landscape"]:
+                ext = ".jpg"
+            target = f"{bases['landscape']}{ext}"
+            reused = await asyncio.to_thread(_copy_file_sync, source, target)
+            if reused:
+                await asyncio.to_thread(
+                    _remove_variants_sync,
+                    bases["landscape"],
+                    [value for value in allowed_exts["landscape"] if value != ext],
+                )
+                status["landscape"] = True
+                written["landscape"] = target
 
     # Fallback: no dedicated icon -> reuse portrait, then landscape.
     if not status.get("icon"):
-        reused = False
-        if status.get("portrait"):
-            reused = await asyncio.to_thread(_copy_file_sync, portrait_path, icon_path)
-        elif status.get("landscape"):
-            reused = await asyncio.to_thread(_copy_file_sync, landscape_path, icon_path)
-        status["icon"] = bool(reused)
+        source = written.get("portrait") or written.get("landscape")
+        if source:
+            ext = os.path.splitext(source)[1] or ".jpg"
+            if ext not in allowed_exts["icon"]:
+                ext = ".jpg"
+            target = f"{bases['icon']}{ext}"
+            reused = await asyncio.to_thread(_copy_file_sync, source, target)
+            if reused:
+                await asyncio.to_thread(
+                    _remove_variants_sync,
+                    bases["icon"],
+                    [value for value in allowed_exts["icon"] if value != ext],
+                )
+                status["icon"] = True
+                written["icon"] = target
 
     # Fallback: no hero -> reuse landscape.
     if not status.get("hero") and status.get("landscape"):
-        reused = await asyncio.to_thread(_copy_file_sync, landscape_path, hero_path)
-        status["hero"] = bool(reused)
+        source = written.get("landscape")
+        if source:
+            ext = os.path.splitext(source)[1] or ".jpg"
+            if ext not in allowed_exts["hero"]:
+                ext = ".jpg"
+            target = f"{bases['hero']}{ext}"
+            reused = await asyncio.to_thread(_copy_file_sync, source, target)
+            if reused:
+                await asyncio.to_thread(
+                    _remove_variants_sync,
+                    bases["hero"],
+                    [value for value in allowed_exts["hero"] if value != ext],
+                )
+                status["hero"] = True
+                written["hero"] = target
 
-    return {"ok": True, "status": status}
+    # If this refresh resolved any artwork, remove stale leftovers for types that
+    # still have no valid replacement so Steam does not keep showing old mismatched assets.
+    if any(status.values()):
+        for key, ok in status.items():
+            if ok:
+                continue
+            await asyncio.to_thread(_remove_variants_sync, bases[key], allowed_exts[key])
+
+    return {"ok": True, "status": status, "written": written}
 
 
 def _default_landscape_cover(app_id: int) -> str:
@@ -622,6 +839,50 @@ def _derive_tianyi_launch_token(game_id: str) -> str:
     token = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(game_id or "")).strip("_")
     return token or "game"
 
+_TIANYI_LAUNCH_TOKEN_RE = re.compile(r"freedeck:tianyi:(?P<token>[A-Za-z0-9._-]+)")
+
+
+def _extract_tianyi_launch_token(launch_options: str) -> str:
+    """Extract Freedeck launch token from Steam LaunchOptions (allow prefix/wrappers)."""
+    text = str(launch_options or "").strip()
+    if not text:
+        return ""
+    match = _TIANYI_LAUNCH_TOKEN_RE.search(text)
+    if not match:
+        return ""
+    return str(match.group("token") or "").strip()
+
+
+def _tianyi_devkit_game_id(token: str) -> str:
+    """Encode token into a Steam shortcut field that does NOT affect process args."""
+    value = str(token or "").strip()
+    if not value:
+        return ""
+    return f"freedeck:tianyi:{value}"
+
+
+def _strip_tianyi_launch_token(text: str) -> str:
+    """Remove internal Freedeck token from launch options (keep other user args)."""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    cleaned = _TIANYI_LAUNCH_TOKEN_RE.sub("", raw)
+    return " ".join(cleaned.split()).strip()
+
+
+def _extract_tianyi_token_from_shortcut(item: Any) -> str:
+    """Extract token from shortcut entry.
+
+    Prefer DevkitGameID (new) and fall back to LaunchOptions (legacy).
+    """
+    if not isinstance(item, dict):
+        return ""
+    devkit = _extract_tianyi_launch_token(str(item.get("DevkitGameID", "") or ""))
+    if devkit:
+        return devkit
+    launch = _extract_tianyi_launch_token(str(item.get("LaunchOptions", "") or ""))
+    return launch
+
 
 def list_tianyi_shortcuts_sync() -> Dict[str, Any]:
     """List Freedeck Tianyi shortcuts in one pass for fast appid mapping."""
@@ -639,7 +900,6 @@ def list_tianyi_shortcuts_sync() -> Dict[str, Any]:
     if not isinstance(shortcuts, dict):
         shortcuts = {}
 
-    prefix = "freedeck:tianyi:"
     rows: List[Dict[str, Any]] = []
     by_token: Dict[str, Dict[str, Any]] = {}
     by_appid: Dict[str, Dict[str, Any]] = {}
@@ -648,19 +908,18 @@ def list_tianyi_shortcuts_sync() -> Dict[str, Any]:
         if not isinstance(item, dict):
             continue
 
-        launch_options = str(item.get("LaunchOptions", "") or "").strip()
-        if not launch_options.startswith(prefix):
-            continue
-
-        token = str(launch_options[len(prefix) :]).strip()
+        token = _extract_tianyi_token_from_shortcut(item)
         if not token:
             continue
 
+        launch_options = str(item.get("LaunchOptions", "") or "").strip()
+        devkit_game_id = str(item.get("DevkitGameID", "") or "").strip()
         app_id = _safe_int(item.get("appid"), 0)
         app_id_unsigned = int(app_id) & 0xFFFFFFFF if app_id else 0
         row = {
             "token": token,
             "launch_options": launch_options,
+            "devkit_game_id": devkit_game_id,
             "appid": int(app_id),
             "appid_unsigned": int(app_id_unsigned),
             "app_name": str(item.get("AppName", "") or "").strip(),
@@ -682,9 +941,102 @@ def list_tianyi_shortcuts_sync() -> Dict[str, Any]:
     }
 
 
+def migrate_tianyi_shortcut_tokens_sync() -> Dict[str, Any]:
+    """Migrate legacy Freedeck launch tokens from LaunchOptions to DevkitGameID.
+
+    Older versions stored `freedeck:tianyi:<token>` in LaunchOptions which could be passed to the game as an argument,
+    causing some titles to fail to launch. The token is now stored in DevkitGameID so Steam launch arguments stay clean.
+    """
+    steam_root = _find_steam_root()
+    if not steam_root:
+        return {"ok": False, "changed": False, "message": "未找到 Steam 安装目录", "migrated": 0, "cleaned": 0}
+
+    user_id = _detect_active_user(steam_root)
+    if not user_id:
+        return {"ok": False, "changed": False, "message": "未找到已登录 Steam 用户", "migrated": 0, "cleaned": 0}
+
+    shortcuts_file = _shortcuts_path(steam_root, user_id)
+    payload = _load_shortcuts_vdf(shortcuts_file)
+    shortcuts = payload.get("shortcuts") if isinstance(payload, dict) else {}
+    if not isinstance(shortcuts, dict) or not shortcuts:
+        return {
+            "ok": True,
+            "changed": False,
+            "message": "无需迁移（shortcuts 为空）",
+            "steam_root": steam_root,
+            "user_id": user_id,
+            "shortcut_path": shortcuts_file,
+            "migrated": 0,
+            "cleaned": 0,
+        }
+
+    changed = False
+    migrated = 0
+    cleaned = 0
+    for item in shortcuts.values():
+        if not isinstance(item, dict):
+            continue
+        launch_options = str(item.get("LaunchOptions", "") or "").strip()
+        devkit_game_id = str(item.get("DevkitGameID", "") or "").strip()
+        token_in_launch = _extract_tianyi_launch_token(launch_options)
+        token_in_devkit = _extract_tianyi_launch_token(devkit_game_id)
+        token = token_in_devkit or token_in_launch
+        if not token:
+            continue
+
+        if token_in_launch:
+            next_launch = _strip_tianyi_launch_token(launch_options)
+            if next_launch != launch_options:
+                item["LaunchOptions"] = next_launch
+                cleaned += 1
+                changed = True
+            if not token_in_devkit:
+                item["DevkitGameID"] = _tianyi_devkit_game_id(token)
+                migrated += 1
+                changed = True
+
+    if not changed:
+        return {
+            "ok": True,
+            "changed": False,
+            "message": "无需迁移（已是新格式）",
+            "steam_root": steam_root,
+            "user_id": user_id,
+            "shortcut_path": shortcuts_file,
+            "migrated": 0,
+            "cleaned": 0,
+        }
+
+    try:
+        _save_shortcuts_vdf(shortcuts_file, payload)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "changed": False,
+            "message": f"写入 shortcuts.vdf 失败: {exc}",
+            "steam_root": steam_root,
+            "user_id": user_id,
+            "shortcut_path": shortcuts_file,
+            "migrated": migrated,
+            "cleaned": cleaned,
+        }
+
+    return {
+        "ok": True,
+        "changed": True,
+        "message": "已迁移 LaunchOptions token",
+        "steam_root": steam_root,
+        "user_id": user_id,
+        "shortcut_path": shortcuts_file,
+        "migrated": migrated,
+        "cleaned": cleaned,
+    }
+
+
 def resolve_tianyi_shortcut_sync(*, game_id: str) -> Dict[str, Any]:
     """Resolve Freedeck shortcut metadata by game_id."""
-    launch_options = f"freedeck:tianyi:{_derive_tianyi_launch_token(game_id)}"
+    expected_token = _derive_tianyi_launch_token(game_id)
+    expected_launch_options = _tianyi_devkit_game_id(expected_token) or f"freedeck:tianyi:{expected_token}"
 
     steam_root = _find_steam_root()
     if not steam_root:
@@ -692,7 +1044,7 @@ def resolve_tianyi_shortcut_sync(*, game_id: str) -> Dict[str, Any]:
 
     user_id = _detect_active_user(steam_root)
     if not user_id:
-        return {"ok": False, "message": "未找到已登录 Steam 用户"}
+        return {"ok": False, "message": "未找到已登录 Steam 用户", "steam_root": steam_root}
 
     shortcuts_file = _shortcuts_path(steam_root, user_id)
     payload = _load_shortcuts_vdf(shortcuts_file)
@@ -704,7 +1056,8 @@ def resolve_tianyi_shortcut_sync(*, game_id: str) -> Dict[str, Any]:
     for _, item in shortcuts.items():
         if not isinstance(item, dict):
             continue
-        if str(item.get("LaunchOptions", "") or "").strip() == launch_options:
+        token = _extract_tianyi_token_from_shortcut(item)
+        if token == expected_token:
             target = item
             break
 
@@ -712,10 +1065,14 @@ def resolve_tianyi_shortcut_sync(*, game_id: str) -> Dict[str, Any]:
         return {
             "ok": False,
             "message": "未找到对应 Freedeck 快捷方式",
-            "launch_options": launch_options,
+            "launch_options": expected_launch_options,
             "steam_root": steam_root,
             "user_id": user_id,
         }
+
+    exe_path = _strip_outer_quotes(str(target.get("exe", "") or target.get("Exe", "") or ""))
+    start_dir = _strip_outer_quotes(str(target.get("StartDir", "") or ""))
+    app_name = str(target.get("AppName", "") or "").strip()
 
     app_id = _safe_int(target.get("appid"), 0)
     app_id_unsigned = int(app_id) & 0xFFFFFFFF if app_id else 0
@@ -730,6 +1087,37 @@ def resolve_tianyi_shortcut_sync(*, game_id: str) -> Dict[str, Any]:
         if os.path.isdir(candidate):
             compat_user_dir = os.path.realpath(candidate)
             break
+    if not compat_user_dir and os.path.isdir(compat_root):
+        extra_candidates: List[str] = []
+        try:
+            with os.scandir(compat_root) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        extra_candidates.append(entry.path)
+        except Exception:
+            extra_candidates = []
+
+        if extra_candidates:
+            ignored = {"public", "default", "default user", "all users"}
+
+            def score(path: str) -> Tuple[int, str]:
+                name = os.path.basename(path).strip()
+                lowered = name.lower()
+                points = 0
+                if lowered in ignored:
+                    points -= 50
+                if os.path.isdir(os.path.join(path, "AppData")):
+                    points += 20
+                if os.path.isdir(os.path.join(path, "Documents")):
+                    points += 10
+                if os.path.isdir(os.path.join(path, "Saved Games")):
+                    points += 10
+                if "user" in lowered:
+                    points += 2
+                return points, lowered
+
+            extra_candidates.sort(key=lambda item: score(item), reverse=True)
+            compat_user_dir = os.path.realpath(extra_candidates[0])
 
     return {
         "ok": True,
@@ -737,7 +1125,10 @@ def resolve_tianyi_shortcut_sync(*, game_id: str) -> Dict[str, Any]:
         "steam_root": steam_root,
         "user_id": user_id,
         "shortcut_path": shortcuts_file,
-        "launch_options": launch_options,
+        "launch_options": str(target.get("LaunchOptions", "") or "").strip(),
+        "app_name": app_name,
+        "exe_path": exe_path,
+        "start_dir": start_dir,
         "appid": int(app_id),
         "appid_unsigned": int(app_id_unsigned),
         "compat_user_dir": compat_user_dir,
@@ -750,7 +1141,7 @@ async def add_or_update_tianyi_shortcut(
     display_name: str,
     exe_path: str,
     launch_options: str,
-    proton_tool: str = "proton_experimental",
+    proton_tool: str = "",
     cover_landscape_url: str = "",
     cover_portrait_url: str = "",
     cover_hero_url: str = "",
@@ -773,12 +1164,29 @@ async def add_or_update_tianyi_shortcut(
     user_id = str(shortcut.get("user_id", "") or "")
     app_id = _safe_int(shortcut.get("appid"), 0)
 
-    proton = await asyncio.to_thread(
-        _set_proton_mapping_sync,
-        steam_root=steam_root,
-        app_id=app_id,
-        compat_tool=str(proton_tool or "").strip() or "proton_experimental",
-    )
+    proton_tool_name = str(proton_tool or "").strip()
+    if proton_tool_name:
+        proton = await asyncio.to_thread(
+            _set_proton_mapping_sync,
+            steam_root=steam_root,
+            app_id=app_id,
+            compat_tool=proton_tool_name,
+        )
+    else:
+        current_mapping = await asyncio.to_thread(
+            _get_proton_mapping_sync,
+            steam_root=steam_root,
+            app_id=app_id,
+        )
+        current_tool = str(current_mapping.get("compat_tool", "") or "").strip().lower()
+        if current_tool in {"proton_experimental", "proton-experimental"}:
+            proton = await asyncio.to_thread(
+                _remove_proton_mapping_sync,
+                steam_root=steam_root,
+                app_id=app_id,
+            )
+        else:
+            proton = {"ok": True, "message": "未设置兼容层映射"}
 
     landscape = str(cover_landscape_url or "").strip()
     portrait = str(cover_portrait_url or "").strip()
@@ -810,7 +1218,7 @@ async def add_or_update_tianyi_shortcut(
     return result
 
 
-async def remove_tianyi_shortcut(*, game_id: str) -> Dict[str, Any]:
+async def remove_tianyi_shortcut(*, game_id: str, delete_compatdata: bool = False, fallback_app_id: int = 0) -> Dict[str, Any]:
     """Remove Freedeck shortcut and best-effort cleanup Proton mapping and artwork."""
     target_game_id = str(game_id or "").strip()
     if not target_game_id:
@@ -830,7 +1238,20 @@ async def remove_tianyi_shortcut(*, game_id: str) -> Dict[str, Any]:
             "failed": [],
             "message": "未执行封面清理（快捷方式不存在）",
         }
-        result["cleanup_ok"] = True
+        if delete_compatdata:
+            steam_root = str(shortcut.get("steam_root", "") or "").strip()
+            compat_app_id = _safe_int(fallback_app_id, 0)
+            if steam_root and compat_app_id > 0:
+                result["compatdata"] = await asyncio.to_thread(
+                    _remove_compatdata_prefix_sync,
+                    steam_root=steam_root,
+                    app_id=compat_app_id,
+                )
+            else:
+                result["compatdata"] = {"ok": True, "removed": False, "message": "未执行 Proton 前缀清理（快捷方式不存在）"}
+        else:
+            result["compatdata"] = {"ok": True, "removed": False, "message": "跳过 Proton 前缀清理"}
+        result["cleanup_ok"] = bool(result["compatdata"].get("ok"))
         return result
 
     steam_root = str(shortcut.get("steam_root", "") or "").strip()
@@ -845,6 +1266,7 @@ async def remove_tianyi_shortcut(*, game_id: str) -> Dict[str, Any]:
         "failed": [],
         "message": "跳过封面清理（appid 或 user_id 无效）",
     }
+    compatdata: Dict[str, Any] = {"ok": True, "removed": False, "message": "跳过 Proton 前缀清理"}
 
     if steam_root and app_id > 0:
         proton = await asyncio.to_thread(_remove_proton_mapping_sync, steam_root=steam_root, app_id=app_id)
@@ -855,9 +1277,20 @@ async def remove_tianyi_shortcut(*, game_id: str) -> Dict[str, Any]:
                 user_id=user_id,
                 app_id=app_id,
             )
+        if delete_compatdata:
+            compatdata = await asyncio.to_thread(_remove_compatdata_prefix_sync, steam_root=steam_root, app_id=app_id)
+    elif delete_compatdata and steam_root and _safe_int(fallback_app_id, 0) > 0:
+        compatdata = await asyncio.to_thread(
+            _remove_compatdata_prefix_sync,
+            steam_root=steam_root,
+            app_id=_safe_int(fallback_app_id, 0),
+        )
+    elif delete_compatdata:
+        compatdata = {"ok": False, "removed": False, "message": "缺少 appid，无法删除 Proton 前缀"}
 
     result["proton"] = proton
     result["artwork"] = artwork
-    result["cleanup_ok"] = bool(proton.get("ok")) and bool(artwork.get("ok"))
+    result["compatdata"] = compatdata
+    result["cleanup_ok"] = bool(proton.get("ok")) and bool(artwork.get("ok")) and bool(compatdata.get("ok"))
     return result
 
